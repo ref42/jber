@@ -2,14 +2,9 @@
 
 //! `jerber` — convert a Gerber archive into a JLCPCB-ready set.
 
-mod banner;
 mod eda;
 mod excellon;
-mod gerber;
-mod naming;
 mod pipeline;
-mod stack;
-mod watermark;
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};

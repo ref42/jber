@@ -1,8 +1,10 @@
-/* src/eda.rs */
+//! EDA-tool identification.
+//!
+//! Detection only looks at the first ten lines of the first 4096 bytes of a
+//! file, because every exporter stamps its name into that window.
 
-//! Source-EDA detection and the ordering used to pick the "primary" file.
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The three supported exporters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Eda {
     Altium,
     KiCad,
@@ -10,6 +12,7 @@ pub enum Eda {
 }
 
 impl Eda {
+    /// Human readable name used in reports.
     pub fn label(self) -> &'static str {
         match self {
             Eda::Altium => "Altium",
@@ -18,7 +21,7 @@ impl Eda {
         }
     }
 
-    /// Suffix used in the converted archive name.
+    /// Two letter tag used in the default output file name.
     pub fn tag(self) -> &'static str {
         match self {
             Eda::Altium => "AD",
@@ -28,10 +31,16 @@ impl Eda {
     }
 }
 
-/// Recognizes the generating tool from a file's leading lines. Altium wins over
-/// KiCad wins over EasyEDA when several markers happen to be present.
-pub fn detect(head: &str) -> Option<Eda> {
-    let head = head.to_ascii_lowercase();
+/// Inspect a file's first 4096 bytes and report the exporter, if any.
+pub(crate) fn detect(bytes: &[u8]) -> Option<Eda> {
+    let window = &bytes[..bytes.len().min(4096)];
+    let text = String::from_utf8_lossy(window);
+    let mut head = String::new();
+    for line in text.lines().take(10) {
+        head.push_str(line);
+        head.push('\n');
+    }
+    let head = head.to_lowercase();
 
     if head.contains("altium") {
         Some(Eda::Altium)
@@ -44,34 +53,57 @@ pub fn detect(head: &str) -> Option<Eda> {
     }
 }
 
-/// KiCad names that identify the outline/copper files.
-const KICAD_MARKERS: [&str; 3] = ["Edge_Cuts", "F_Cu", "F_Mask"];
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Extensions that Altium and most other tools use for plot files, in the
-/// order they are preferred when guessing which file is representative.
-const PLOT_EXTENSIONS: [&str; 6] = ["gto", "gtl", "gbl", "gm13", "gm1", "gko"];
-
-/// Returns the file names ordered so that the most representative Gerber comes
-/// first. The sort is stable, so equal-ranked files keep their archive order.
-pub fn order_for_primary(names: &[String]) -> Vec<String> {
-    let mut ordered = names.to_vec();
-    ordered.sort_by_key(|name| rank(name));
-    ordered
-}
-
-fn rank(name: &str) -> usize {
-    for (index, marker) in KICAD_MARKERS.iter().enumerate() {
-        if name.contains(marker) {
-            return index;
-        }
+    #[test]
+    fn labels_and_tags() {
+        assert_eq!(Eda::Altium.label(), "Altium");
+        assert_eq!(Eda::KiCad.label(), "KiCad");
+        assert_eq!(Eda::EasyEDA.label(), "EasyEDA");
+        assert_eq!(Eda::Altium.tag(), "AD");
+        assert_eq!(Eda::KiCad.tag(), "Ki");
+        assert_eq!(Eda::EasyEDA.tag(), "ED");
     }
 
-    let lower = name.to_ascii_lowercase();
-    for (index, extension) in PLOT_EXTENSIONS.iter().enumerate() {
-        if lower.ends_with(&format!(".{extension}")) {
-            return KICAD_MARKERS.len() + index;
-        }
+    #[test]
+    fn detects_altium() {
+        let data = b"G04*\nG04 #@! TF.GenerationSoftware,Altium Limited*";
+        assert_eq!(detect(data), Some(Eda::Altium));
     }
 
-    usize::MAX
+    #[test]
+    fn detects_kicad() {
+        let data = b"G04 #@! TF.GenerationSoftware,KiCad,Pcbnew*";
+        assert_eq!(detect(data), Some(Eda::KiCad));
+    }
+
+    #[test]
+    fn detects_easyeda() {
+        let data = b"G04 EasyEDA Pro*";
+        assert_eq!(detect(data), Some(Eda::EasyEDA));
+    }
+
+    #[test]
+    fn detection_is_limited_to_ten_lines() {
+        let mut data = Vec::new();
+        for _ in 0..10 {
+            data.extend_from_slice(b"G04 filler*\n");
+        }
+        data.extend_from_slice(b"G04 Altium*\n");
+        assert_eq!(detect(&data), None);
+    }
+
+    #[test]
+    fn detection_is_limited_to_4096_bytes() {
+        let mut data = vec![b'\n'; 5000];
+        data.extend_from_slice(b"Altium");
+        assert_eq!(detect(&data), None);
+    }
+
+    #[test]
+    fn recognizes_nothing() {
+        assert_eq!(detect(b"M48\nMETRIC,LZ\n%"), None);
+    }
 }

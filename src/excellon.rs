@@ -1,337 +1,137 @@
-/* src/excellon.rs */
-
-//! Excellon handling: parse drilling/routing data, merge it per hole size and
-//! emit the two files (plated / non-plated) that fabs expect.
+//! Excellon drill parsing, merging and emission.
+//!
+//! Two dialects are supported: the Altium export (`M48` header with
+//! `T..F..S..C..` tool definitions and zero-suppressed coordinates) and the
+//! KiCad export (decimal millimetre coordinates).
 
 use std::collections::BTreeMap;
-use std::collections::btree_map::Entry;
 
-use crate::banner;
-
-const INCH: f64 = 25.4;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Unit {
-    Metric,
-    Inch,
+/// Whether a drill tool belongs to the plated or non-plated group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Plating {
+    Plated,
+    NonPlated,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Hit {
-    Hole { x: f64, y: f64 },
-    Slot { x1: f64, y1: f64, x2: f64, y2: f64 },
+/// One drill hit. A round hole has identical start and end points; a slot is a
+/// routed segment between them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Hit {
+    pub from: (f64, f64),
+    pub to: (f64, f64),
 }
 
-struct Tool {
-    diameter: f64,
-    plated: bool,
-    hits: Vec<Hit>,
+impl Hit {
+    fn hole(x: f64, y: f64) -> Self {
+        Hit {
+            from: (x, y),
+            to: (x, y),
+        }
+    }
+
+    fn slot(from: (f64, f64), to: (f64, f64)) -> Self {
+        Hit { from, to }
+    }
+
+    fn is_hole(self) -> bool {
+        self.from == self.to
+    }
 }
 
-pub struct Merge {
-    pub plated: Option<String>,
-    pub non_plated: Option<String>,
-    pub warnings: Vec<String>,
+/// A drill tool together with every hit made with it.
+#[derive(Clone, Debug)]
+pub(crate) struct Tool {
+    pub diameter: f64,
+    pub plating: Plating,
+    pub hits: Vec<Hit>,
 }
 
-/// Whether the archive entry is an Excellon drill source.
+/// A name is a drill source when it is a `.drl`, a `.txt` whose name mentions
+/// `hole`/`drill`, or a blind/buried `.tx1`–`.tx6` plot.
 pub fn is_drill_file(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-
-    lower.ends_with(".drl")
-        || (lower.ends_with(".txt") && (lower.contains("hole") || lower.contains("drill")))
-        || is_numbered(&lower)
+    let lower = name.to_lowercase();
+    if lower.ends_with(".drl") {
+        return true;
+    }
+    if lower.ends_with(".txt") && (lower.contains("hole") || lower.contains("drill")) {
+        return true;
+    }
+    (1..=6).any(|index| lower.ends_with(&format!(".tx{index}")))
 }
 
-/// `.TX1`..`.TX6` are blind/buried via layers; JLC only takes through holes.
-fn is_numbered(lower: &str) -> bool {
-    let bytes = lower.as_bytes();
-    bytes.len() >= 4
-        && &lower[bytes.len() - 4..bytes.len() - 1] == ".tx"
-        && matches!(bytes[bytes.len() - 1], b'1'..=b'6')
-}
-
-fn is_through(name: &str) -> bool {
-    !is_numbered(&name.to_ascii_lowercase())
-}
-
-pub fn merge(sources: &[(String, String)], stamp: &mut banner::Stamp) -> Merge {
-    let mut plated: BTreeMap<u64, Tool> = BTreeMap::new();
-    let mut non_plated: BTreeMap<u64, Tool> = BTreeMap::new();
-    let mut warnings = Vec::new();
-
-    for (name, content) in sources {
-        if !is_through(name) {
-            warnings.push(format!(
-                "skipping {name}: blind/buried vias are not supported, only through holes"
-            ));
-            continue;
-        }
-
-        let tools = if content.to_ascii_lowercase().contains("kicad") {
-            parse_kicad(content)
-        } else {
-            parse_altium(content)
-        };
-
-        for tool in tools {
-            let key = (tool.diameter * 100_000.0) as u64;
-            let bucket = if tool.plated {
-                &mut plated
-            } else {
-                &mut non_plated
-            };
-
-            match bucket.entry(key) {
-                Entry::Occupied(mut entry) => entry.get_mut().hits.extend(tool.hits),
-                Entry::Vacant(entry) => {
-                    entry.insert(tool);
-                }
-            }
-        }
-    }
-
-    Merge {
-        plated: emit(&plated, true, stamp),
-        non_plated: emit(&non_plated, false, stamp),
-        warnings,
-    }
-}
-
-fn emit(tools: &BTreeMap<u64, Tool>, plated: bool, stamp: &mut banner::Stamp) -> Option<String> {
-    if tools.is_empty() {
-        return None;
-    }
-
-    let (hole_type, layer) = if plated {
-        ("PLATED", "PTH_Through")
-    } else {
-        ("NON_PLATED", "NPTH_Through")
-    };
-
-    let mut output = stamp.drill_header(hole_type, layer);
-    output.push_str("M48\nMETRIC,LZ,0000.00000\n");
-
-    for (index, tool) in tools.values().enumerate() {
-        let number = index + 1;
-        output.push_str(&format!(
-            ";Hole size {number} = {:.5} METRIC\n",
-            tool.diameter
-        ));
-        output.push_str(&format!("T{number:02}C{:.5}\n", tool.diameter));
-    }
-
-    output.push_str("%\nG05\nG90\n");
-
-    for (index, tool) in tools.values().enumerate() {
-        output.push_str(&format!("T{:02}\n", index + 1));
-        for hit in &tool.hits {
-            match hit {
-                Hit::Hole { x, y } => output.push_str(&format!("X{x:.5}Y{y:.5}\n")),
-                Hit::Slot { x1, y1, x2, y2 } => {
-                    output.push_str(&format!("X{x1:.5}Y{y1:.5}G85X{x2:.5}Y{y2:.5}\n"));
-                }
-            }
-        }
-    }
-
-    output.push_str("M30\n");
-    Some(output)
-}
-
-// --- token helpers ---------------------------------------------------------
-
-fn take_digits(input: &str) -> Option<(u64, &str)> {
-    let digits: String = input.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        return None;
-    }
-    Some((digits.parse().ok()?, &input[digits.len()..]))
-}
-
-fn take_number(input: &str) -> Option<(f64, &str)> {
-    let token: String = input
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
-        .collect();
-    if token.is_empty() {
-        return None;
-    }
-    Some((token.parse().ok()?, &input[token.len()..]))
-}
-
-fn take_coordinate(input: &str) -> Option<(&str, &str)> {
-    let length = input
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit() || *ch == '.' || *ch == '-')
-        .count();
-    if length == 0 {
-        return None;
-    }
-    Some((&input[..length], &input[length..]))
-}
-
-fn tool_select(line: &str) -> Option<u32> {
-    let rest = line.strip_prefix('T')?;
-    let (number, rest) = take_digits(rest)?;
-    if rest.is_empty() {
-        Some(number as u32)
-    } else {
-        None
-    }
-}
-
-/// Parses `X<num>Y<num>` requiring the whole line to be consumed.
-fn coordinate(line: &str) -> Option<(Option<&str>, Option<&str>)> {
-    let mut rest = line;
-    let mut x = None;
-    let mut y = None;
-
-    if let Some(after) = rest.strip_prefix('X') {
-        let (value, remainder) = take_coordinate(after)?;
-        x = Some(value);
-        rest = remainder;
-    }
-    if let Some(after) = rest.strip_prefix('Y') {
-        let (value, remainder) = take_coordinate(after)?;
-        y = Some(value);
-        rest = remainder;
-    }
-
-    if !rest.is_empty() {
-        return None;
-    }
-    Some((x, y))
-}
-
-/// Parses the `G00`/`G01` prefix, ignoring anything after the coordinates.
-fn route<'a>(line: &'a str, code: &str) -> Option<(Option<&'a str>, Option<&'a str>)> {
-    let mut rest = line.strip_prefix(code)?;
-    let mut x = None;
-    let mut y = None;
-
-    if let Some(after) = rest.strip_prefix('X')
-        && let Some((value, remainder)) = take_coordinate(after)
-    {
-        x = Some(value);
-        rest = remainder;
-    }
-    if let Some(after) = rest.strip_prefix('Y')
-        && let Some((value, remainder)) = take_coordinate(after)
-    {
-        y = Some(value);
-        rest = remainder;
-    }
-
-    let _ = rest;
-    Some((x, y))
-}
-
-fn file_format(line: &str) -> Option<(u32, u32)> {
-    let rest = &line[line.find("FILE_FORMAT=")? + "FILE_FORMAT=".len()..];
-    let (integer, rest) = take_digits(rest)?;
-    let rest = rest.strip_prefix(':')?;
-    let (decimal, _) = take_digits(rest)?;
-    Some((integer as u32, decimal as u32))
-}
-
-fn altium_tool(line: &str) -> Option<(u32, f64)> {
-    let rest = line.strip_prefix('T')?;
-    let (number, rest) = take_digits(rest)?;
-    let rest = rest.strip_prefix('F')?;
-    let (_, rest) = take_digits(rest)?;
-    let rest = rest.strip_prefix('S')?;
-    let (_, rest) = take_digits(rest)?;
-    let rest = rest.strip_prefix('C')?;
-    let (diameter, _) = take_number(rest)?;
-    Some((number as u32, diameter))
-}
-
-fn kicad_tool(line: &str) -> Option<(u32, f64)> {
-    let rest = line.strip_prefix('T')?;
-    let (number, rest) = take_digits(rest)?;
-    let rest = rest.strip_prefix('C')?;
-    let (diameter, _) = take_number(rest)?;
-    Some((number as u32, diameter))
+/// `.tx1`–`.tx6` plots are blind/buried via layers, which JLCPCB cannot use.
+pub(crate) fn is_blind_buried(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    (1..=6).any(|index| lower.ends_with(&format!(".tx{index}")))
 }
 
 // --- Altium ----------------------------------------------------------------
 
-fn parse_altium(content: &str) -> Vec<Tool> {
-    let mut unit = Unit::Metric;
-    let mut format = (2u32, 4u32);
-    let mut leading_zero = true;
-    let mut plated = true;
+pub(crate) fn parse_altium(text: &str) -> Vec<Tool> {
+    let mut lines = text.lines();
+
+    let mut unit = 1.0_f64; // millimetres
+    let mut integer_digits = 2_usize;
+    let mut decimal_digits = 4_usize;
+    let mut leading_zeros = true;
+    let mut plating = Plating::Plated;
     let mut tools: BTreeMap<u32, Tool> = BTreeMap::new();
-    let mut in_header = true;
 
-    for line in content.lines() {
-        let line = line.trim();
-
+    // Header: everything before the first bare `%` line.
+    for raw in lines.by_ref() {
+        let line = raw.trim();
         if line == "%" {
-            in_header = false;
-            continue;
-        }
-        if !in_header {
-            continue;
+            break;
         }
 
         let upper = line.to_ascii_uppercase();
         if upper.starts_with("INCH") {
-            unit = Unit::Inch;
-            if upper.contains("LZ") {
-                leading_zero = true;
-            } else if upper.contains("TZ") {
-                leading_zero = false;
-            }
+            unit = 25.4;
         } else if upper.starts_with("METRIC") {
-            unit = Unit::Metric;
-            if upper.contains("LZ") {
-                leading_zero = true;
-            } else if upper.contains("TZ") {
-                leading_zero = false;
+            unit = 1.0;
+        }
+        if upper.contains("LZ") {
+            leading_zeros = true;
+        }
+        if upper.contains("TZ") {
+            leading_zeros = false;
+        }
+        if let Some(position) = upper.find("FILE_FORMAT=") {
+            let spec = &upper[position + "FILE_FORMAT=".len()..];
+            if let Some((left, right)) = spec.split_once(':') {
+                let left = left.trim();
+                let right = right.trim().trim_end_matches('*').trim();
+                if let (Ok(a), Ok(b)) = (left.parse::<usize>(), right.parse::<usize>()) {
+                    integer_digits = a;
+                    decimal_digits = b;
+                }
             }
         }
-
-        if let Some(values) = file_format(line) {
-            format = values;
+        if upper.contains("TYPE=NON_PLATED") {
+            plating = Plating::NonPlated;
+        } else if upper.contains("TYPE=PLATED") {
+            plating = Plating::Plated;
         }
-
-        if line.contains("TYPE=NON_PLATED") {
-            plated = false;
-        } else if line.contains("TYPE=PLATED") {
-            plated = true;
-        }
-
-        if let Some((number, diameter)) = altium_tool(line) {
+        if let Some((number, diameter)) = altium_tool_definition(line) {
             tools.insert(
                 number,
                 Tool {
-                    diameter: if unit == Unit::Inch {
-                        diameter * INCH
-                    } else {
-                        diameter
-                    },
-                    plated,
+                    diameter: diameter * unit,
+                    plating,
                     hits: Vec::new(),
                 },
             );
         }
     }
 
+    // Command section: a small Excellon interpreter.
     let mut current: Option<u32> = None;
+    let mut position = (0.0_f64, 0.0_f64);
     let mut routing = false;
-    let mut last = (0.0f64, 0.0f64);
-    let mut in_header = true;
 
-    for line in content.lines() {
-        let line = line.trim();
-
-        if line == "%" {
-            in_header = false;
-            continue;
-        }
-        if in_header || line.is_empty() || line.starts_with(';') {
+    for raw in lines {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with(';') {
             continue;
         }
 
@@ -342,136 +142,182 @@ fn parse_altium(content: &str) -> Vec<Tool> {
             continue;
         }
 
-        if let Some((x, y)) = route(line, "G00") {
-            if let Some(raw) = x {
-                last.0 = altium_coordinate(raw, format, leading_zero, unit);
-            }
-            if let Some(raw) = y {
-                last.1 = altium_coordinate(raw, format, leading_zero, unit);
+        if let Some(rest) = line.strip_prefix("G00") {
+            if let Some(tokens) = xy_tokens(rest)
+                && let Some(next) = altium_position(
+                    &tokens,
+                    position,
+                    integer_digits,
+                    decimal_digits,
+                    leading_zeros,
+                    unit,
+                )
+            {
+                position = next;
             }
             continue;
         }
-
-        if line == "M15" {
+        if line.starts_with("M15") {
             routing = true;
             continue;
         }
-
-        if routing && let Some((x, y)) = route(line, "G01") {
-            let start = last;
-            if let Some(raw) = x {
-                last.0 = altium_coordinate(raw, format, leading_zero, unit);
-            }
-            if let Some(raw) = y {
-                last.1 = altium_coordinate(raw, format, leading_zero, unit);
-            }
-            if let Some(tool) = current.and_then(|number| tools.get_mut(&number)) {
-                tool.hits.push(Hit::Slot {
-                    x1: start.0,
-                    y1: start.1,
-                    x2: last.0,
-                    y2: last.1,
-                });
-            }
-            continue;
-        }
-
-        if line == "M16" {
+        if line.starts_with("M16") {
             routing = false;
             continue;
         }
 
-        if let Some((x, y)) = coordinate(line) {
-            if x.is_none() && y.is_none() {
-                continue;
+        if let Some(rest) = line.strip_prefix("G01") {
+            if routing
+                && let Some(next) = xy_tokens(rest).and_then(|tokens| {
+                    altium_position(
+                        &tokens,
+                        position,
+                        integer_digits,
+                        decimal_digits,
+                        leading_zeros,
+                        unit,
+                    )
+                })
+            {
+                if let Some(tool) = current.and_then(|number| tools.get_mut(&number)) {
+                    tool.hits.push(Hit::slot(position, next));
+                }
+                position = next;
             }
+            continue;
+        }
+
+        // Any other line that consists only of optional X/Y tokens is a hole.
+        if let Some(next) = xy_tokens(line).and_then(|tokens| {
+            altium_position(
+                &tokens,
+                position,
+                integer_digits,
+                decimal_digits,
+                leading_zeros,
+                unit,
+            )
+        }) {
             if let Some(tool) = current.and_then(|number| tools.get_mut(&number)) {
-                if let Some(raw) = x {
-                    last.0 = altium_coordinate(raw, format, leading_zero, unit);
-                }
-                if let Some(raw) = y {
-                    last.1 = altium_coordinate(raw, format, leading_zero, unit);
-                }
-                tool.hits.push(Hit::Hole {
-                    x: last.0,
-                    y: last.1,
-                });
+                tool.hits.push(Hit::hole(next.0, next.1));
             }
+            position = next;
         }
     }
 
-    tools
-        .into_values()
-        .filter(|tool| !tool.hits.is_empty())
-        .collect()
+    tools.into_values().collect()
 }
 
-fn altium_coordinate(raw: &str, format: (u32, u32), leading_zero: bool, unit: Unit) -> f64 {
-    if raw.contains('.') {
-        let value: f64 = raw.parse().unwrap_or(0.0);
-        return if unit == Unit::Inch {
-            value * INCH
-        } else {
-            value
-        };
+/// Aperture definition of the form `T<number>F<digits>S<digits>C<number>`.
+fn altium_tool_definition(line: &str) -> Option<(u32, f64)> {
+    let rest = line.strip_prefix('T')?;
+    let number_end = rest.find(|c: char| !c.is_ascii_digit())?;
+    if number_end == 0 {
+        return None;
     }
+    let number: u32 = rest[..number_end].parse().ok()?;
 
-    let sign = if raw.starts_with('-') { -1.0 } else { 1.0 };
-    let magnitude = raw.trim_start_matches(['+', '-']);
+    let rest = rest[number_end..].strip_prefix('F')?;
+    let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    let rest = rest.strip_prefix('S')?;
+    let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    let rest = rest.strip_prefix('C')?;
+    let diameter: f64 = rest.trim().trim_end_matches('*').trim().parse().ok()?;
+    Some((number, diameter))
+}
 
-    let value = if leading_zero {
-        let integer_places = format.0 as usize;
-        if magnitude.len() <= integer_places {
-            magnitude.parse::<f64>().unwrap_or(0.0)
+fn tool_select(line: &str) -> Option<u32> {
+    let rest = line.strip_prefix('T')?;
+    if rest.is_empty() || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
+}
+
+fn altium_position(
+    tokens: &[(char, &str)],
+    current: (f64, f64),
+    integer_digits: usize,
+    decimal_digits: usize,
+    leading_zeros: bool,
+    unit: f64,
+) -> Option<(f64, f64)> {
+    let mut position = current;
+    for &(axis, token) in tokens {
+        let value = altium_coordinate(token, integer_digits, decimal_digits, leading_zeros, unit)?;
+        if axis == 'X' {
+            position.0 = value;
         } else {
-            let integer_part = &magnitude[..integer_places];
-            let decimal_part = &magnitude[integer_places..];
-            let integer: f64 = integer_part.parse().unwrap_or(0.0);
-            let decimal = if decimal_part.is_empty() {
-                0.0
-            } else {
-                decimal_part.parse::<f64>().unwrap_or(0.0) / 10_f64.powi(decimal_part.len() as i32)
-            };
-            integer + decimal
+            position.1 = value;
         }
+    }
+    Some(position)
+}
+
+fn altium_coordinate(
+    token: &str,
+    integer_digits: usize,
+    decimal_digits: usize,
+    leading_zeros: bool,
+    unit: f64,
+) -> Option<f64> {
+    let (sign, body) = if let Some(rest) = token.strip_prefix('-') {
+        (-1.0, rest)
+    } else if let Some(rest) = token.strip_prefix('+') {
+        (1.0, rest)
     } else {
-        magnitude
-            .parse::<i64>()
-            .map(|value| value as f64 / 10_f64.powi(format.1 as i32))
-            .unwrap_or(0.0)
+        (1.0, token)
     };
 
-    let value = sign * value;
-    if unit == Unit::Inch {
-        value * INCH
-    } else {
-        value
+    if body.contains('.') {
+        let value: f64 = body.parse().ok()?;
+        return Some(sign * value * unit);
     }
+    if body.is_empty() || !body.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    let value = if leading_zeros {
+        if body.len() > integer_digits {
+            let (whole_text, fraction_text) = body.split_at(integer_digits);
+            let whole = whole_text.parse::<f64>().ok()?;
+            let fraction =
+                fraction_text.parse::<f64>().ok()? / 10_f64.powi(fraction_text.len() as i32);
+            whole + fraction
+        } else {
+            body.parse::<f64>().ok()?
+        }
+    } else {
+        let raw: f64 = body.parse().ok()?;
+        raw / 10_f64.powi(decimal_digits as i32)
+    };
+
+    Some(sign * value * unit)
 }
 
 // --- KiCad -----------------------------------------------------------------
 
-fn parse_kicad(content: &str) -> Vec<Tool> {
-    let plated = !(content.contains("NonPlated") || content.contains("NPTH"));
+pub(crate) fn parse_kicad(text: &str) -> Vec<Tool> {
+    let plating = if text.contains("NonPlated") || text.contains("NPTH") {
+        Plating::NonPlated
+    } else {
+        Plating::Plated
+    };
+
+    let mut lines = text.lines();
     let mut tools: BTreeMap<u32, Tool> = BTreeMap::new();
-    let mut in_header = true;
 
-    for line in content.lines() {
-        let line = line.trim();
+    for raw in lines.by_ref() {
+        let line = raw.trim();
         if line == "%" {
-            in_header = false;
-            continue;
+            break;
         }
-        if !in_header {
-            continue;
-        }
-
-        if let Some((number, diameter)) = kicad_tool(line) {
+        if let Some((number, diameter)) = kicad_tool_definition(line) {
             tools.insert(
                 number,
                 Tool {
                     diameter,
-                    plated,
+                    plating,
                     hits: Vec::new(),
                 },
             );
@@ -479,19 +325,12 @@ fn parse_kicad(content: &str) -> Vec<Tool> {
     }
 
     let mut current: Option<u32> = None;
+    let mut position = (0.0_f64, 0.0_f64);
     let mut routing = false;
-    let mut route_start: Option<(f64, f64)> = None;
-    let mut last_y = 0.0f64;
-    let mut in_header = true;
 
-    for line in content.lines() {
-        let line = line.trim();
-
-        if line == "%" {
-            in_header = false;
-            continue;
-        }
-        if in_header || line.is_empty() || line.starts_with(';') {
+    for raw in lines {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with(';') {
             continue;
         }
 
@@ -502,60 +341,188 @@ fn parse_kicad(content: &str) -> Vec<Tool> {
             continue;
         }
 
-        if let Some((x, y)) = route(line, "G00") {
-            let x: f64 = x.and_then(|raw| raw.parse().ok()).unwrap_or(0.0);
-            let y: f64 = y.and_then(|raw| raw.parse().ok()).unwrap_or(0.0);
-            route_start = Some((x, y));
-            last_y = y;
+        if let Some(rest) = line.strip_prefix("G00") {
+            if let Some(next) =
+                xy_tokens(rest).and_then(|tokens| decimal_position(&tokens, position))
+            {
+                position = next;
+            }
             continue;
         }
-
-        if line == "M15" {
+        if line.starts_with("M15") {
             routing = true;
             continue;
         }
-
-        if routing && let Some((x, y)) = route(line, "G01") {
-            let end_x: f64 = x.and_then(|raw| raw.parse().ok()).unwrap_or(0.0);
-            let end_y: f64 = y.and_then(|raw| raw.parse().ok()).unwrap_or(last_y);
-
-            if let (Some(number), Some((start_x, start_y))) = (current, route_start)
-                && let Some(tool) = tools.get_mut(&number)
-            {
-                tool.hits.push(Hit::Slot {
-                    x1: start_x,
-                    y1: start_y,
-                    x2: end_x,
-                    y2: end_y,
-                });
-            }
-            last_y = end_y;
-            continue;
-        }
-
-        if line == "M16" {
+        if line.starts_with("M16") {
             routing = false;
-            route_start = None;
             continue;
         }
 
-        if line.starts_with('X') && line.contains('Y') {
-            let rest = &line[1..];
-            if let Some((x, rest)) = take_coordinate(rest)
-                && let Some(rest) = rest.strip_prefix('Y')
-                && let Some((y, _)) = take_coordinate(rest)
-                && let (Ok(x), Ok(y)) = (x.parse::<f64>(), y.parse::<f64>())
-                && let Some(tool) = current.and_then(|number| tools.get_mut(&number))
+        if let Some(rest) = line.strip_prefix("G01") {
+            if routing
+                && let Some(next) =
+                    xy_tokens(rest).and_then(|tokens| decimal_position(&tokens, position))
             {
-                tool.hits.push(Hit::Hole { x, y });
+                if let Some(tool) = current.and_then(|number| tools.get_mut(&number)) {
+                    tool.hits.push(Hit::slot(position, next));
+                }
+                position = next;
+            }
+            continue;
+        }
+
+        if line.starts_with('X')
+            && line.contains('Y')
+            && let Some(next) =
+                xy_tokens(line).and_then(|tokens| decimal_position(&tokens, position))
+        {
+            if let Some(tool) = current.and_then(|number| tools.get_mut(&number)) {
+                tool.hits.push(Hit::hole(next.0, next.1));
+            }
+            position = next;
+        }
+    }
+
+    tools.into_values().collect()
+}
+
+fn kicad_tool_definition(line: &str) -> Option<(u32, f64)> {
+    let rest = line.strip_prefix('T')?;
+    let split = rest.find('C')?;
+    let number: u32 = rest[..split].parse().ok()?;
+    let diameter: f64 = rest[split + 1..]
+        .trim()
+        .trim_end_matches('*')
+        .trim()
+        .parse()
+        .ok()?;
+    Some((number, diameter))
+}
+
+fn decimal_position(tokens: &[(char, &str)], current: (f64, f64)) -> Option<(f64, f64)> {
+    let mut position = current;
+    for &(axis, token) in tokens {
+        let value: f64 = token.parse().ok()?;
+        if axis == 'X' {
+            position.0 = value;
+        } else {
+            position.1 = value;
+        }
+    }
+    Some(position)
+}
+
+// --- Shared parsing helpers ------------------------------------------------
+
+/// Split a command remainder into `X...`/`Y...` tokens. Returns `None` when
+/// anything other than coordinate tokens is present.
+fn xy_tokens(text: &str) -> Option<Vec<(char, &str)>> {
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return None;
+    }
+
+    let mut tokens = Vec::new();
+    while !rest.is_empty() {
+        let axis = rest.chars().next()?;
+        if axis != 'X' && axis != 'Y' {
+            return None;
+        }
+        let tail = &rest[1..];
+        let end = tail.find(['X', 'Y']).unwrap_or(tail.len());
+        let token = tail[..end].trim().trim_end_matches('*').trim();
+        if token.is_empty() {
+            return None;
+        }
+        tokens.push((axis, token));
+        rest = &tail[end..];
+    }
+    Some(tokens)
+}
+
+// --- Merge and emit --------------------------------------------------------
+
+/// Merge every parsed tool into one plated and one non-plated list. Tools are
+/// keyed by `round(diameter * 100000)` and sorted by that key.
+pub(crate) fn merge(tools: Vec<Tool>) -> (Vec<Tool>, Vec<Tool>) {
+    let mut plated: BTreeMap<i64, Tool> = BTreeMap::new();
+    let mut non_plated: BTreeMap<i64, Tool> = BTreeMap::new();
+
+    for tool in tools {
+        if tool.hits.is_empty() {
+            continue;
+        }
+        let key = (tool.diameter * 100_000.0).round() as i64;
+        let group = match tool.plating {
+            Plating::Plated => &mut plated,
+            Plating::NonPlated => &mut non_plated,
+        };
+        match group.get_mut(&key) {
+            Some(existing) => existing.hits.extend(tool.hits),
+            None => {
+                group.insert(
+                    key,
+                    Tool {
+                        diameter: key as f64 / 100_000.0,
+                        plating: tool.plating,
+                        hits: tool.hits,
+                    },
+                );
             }
         }
     }
 
-    tools
-        .into_values()
-        .filter(|tool| !tool.hits.is_empty())
-        .collect()
+    (
+        plated.into_values().collect(),
+        non_plated.into_values().collect(),
+    )
+}
+
+/// Render one merged drill file, using the shared run stamp.
+pub(crate) fn render(tools: &[Tool], plating: Plating, stamp: &str) -> String {
+    let (type_name, layer) = match plating {
+        Plating::Plated => ("PLATED", "PTH_Through"),
+        Plating::NonPlated => ("NON_PLATED", "NPTH_Through"),
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        ";TYPE={type_name}\n;Layer: {layer}\n;{stamp}\n;Gerber Generator version 0.3\nM48\nMETRIC,LZ,0000.00000\n"
+    ));
+
+    for (index, tool) in tools.iter().enumerate() {
+        let number = index + 1;
+        out.push_str(&format!(
+            ";Hole size {number} = {:.5} METRIC\nT{number:02}C{:.5}\n",
+            tool.diameter, tool.diameter
+        ));
+    }
+
+    out.push_str("%\nG05\nG90\n");
+
+    for (index, tool) in tools.iter().enumerate() {
+        out.push_str(&format!("T{:02}\n", index + 1));
+        for hit in &tool.hits {
+            if hit.is_hole() {
+                out.push_str(&format!("X{}Y{}\n", coord(hit.to.0), coord(hit.to.1)));
+            } else {
+                out.push_str(&format!(
+                    "X{}Y{}G85X{}Y{}\n",
+                    coord(hit.from.0),
+                    coord(hit.from.1),
+                    coord(hit.to.0),
+                    coord(hit.to.1)
+                ));
+            }
+        }
+    }
+
+    out.push_str("M30\n");
+    out
+}
+
+fn coord(value: f64) -> String {
+    format!("{value:.5}")
 }
 
 #[cfg(test)]
@@ -563,34 +530,196 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_altium_metric_drills() {
-        let content = "M48\n;FILE_FORMAT=4:4\nMETRIC,LZ\n;TYPE=PLATED\nT01F00S00C0.3000\n%\nT01\nX0033086Y0002907\nM30\n";
-        let tools = parse_altium(content);
+    fn recognises_drill_names() {
+        assert!(is_drill_file("board.drl"));
+        assert!(is_drill_file("main-RoundHoles.TXT"));
+        assert!(is_drill_file("main-SlotHoles.TXT"));
+        assert!(is_drill_file("main.TX1"));
+        assert!(!is_drill_file("main.TX7"));
+        assert!(!is_drill_file("Status Report.Txt"));
+        assert!(!is_drill_file("main.GTL"));
+    }
+
+    #[test]
+    fn altium_round_and_slot_hits() {
+        let text = "\
+M48
+;FILE_FORMAT=4:4
+METRIC,LZ
+;TYPE=PLATED
+T01F00S00C0.3000
+;TYPE=NON_PLATED
+T04F00S00C0.9000
+%
+T01
+X0033086Y0002907
+X00321535Y00102652
+T04
+X00369992Y00071361
+Y00101361
+M30
+";
+        let tools = parse_altium(text);
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].plating, Plating::Plated);
+        assert_eq!(tools[0].hits.len(), 2);
+        assert_eq!(tools[1].plating, Plating::NonPlated);
+        assert_eq!(tools[1].hits.len(), 2);
+
+        let (pth, npth) = merge(tools);
+        assert_eq!(pth.len(), 1);
+        assert_eq!(npth.len(), 1);
+        assert!((pth[0].diameter - 0.3).abs() < 1e-9);
+        assert!((npth[0].diameter - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn altium_slot_route() {
+        let text = "\
+M48
+;FILE_FORMAT=4:4
+METRIC,LZ
+;TYPE=PLATED
+T02F00S00C0.5000
+%
+G90
+G05
+T02
+G00X00340041Y001438
+M15
+G01X00335041
+M16
+M30
+";
+        let tools = parse_altium(text);
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].diameter, 0.3);
         assert_eq!(tools[0].hits.len(), 1);
-        assert_eq!(
-            tools[0].hits[0],
-            Hit::Hole {
-                x: 33.086,
-                y: 2.907
-            }
+        let hit = tools[0].hits[0];
+        assert!(!hit.is_hole());
+        assert!((hit.from.0 - 34.0041).abs() < 1e-9);
+        assert!((hit.from.1 - 14.38).abs() < 1e-9);
+        assert!((hit.to.0 - 33.5041).abs() < 1e-9);
+        assert!((hit.to.1 - 14.38).abs() < 1e-9);
+    }
+
+    #[test]
+    fn altium_trailing_zeros_and_inches() {
+        let text = "\
+M48
+INCH,TZ
+;FILE_FORMAT=2:4
+T01F00S00C0.0100
+%
+T01
+X100000Y020000
+M30
+";
+        let tools = parse_altium(text);
+        assert_eq!(tools.len(), 1);
+        let hit = tools[0].hits[0];
+        // 10.0000 inch, 2.0000 inch, converted to millimetres.
+        assert!((hit.to.0 - 254.0).abs() < 1e-9);
+        assert!((hit.to.1 - 50.8).abs() < 1e-9);
+        assert!((tools[0].diameter - 0.254).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kicad_decimal_holes() {
+        let text = "\
+M48
+;DRILL file {KiCad 8.0}
+FMAT,2
+METRIC
+T1C0.400
+T2C0.800
+%
+G90
+G05
+T1
+X10.500Y20.250
+X11.000Y20.250
+T2
+X12.000Y20.250
+M30
+";
+        let tools = parse_kicad(text);
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].hits.len(), 2);
+        assert_eq!(tools[1].hits.len(), 1);
+        assert!((tools[0].hits[1].to.0 - 11.0).abs() < 1e-9);
+        assert!((tools[0].hits[1].to.1 - 20.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kicad_non_plated_and_slot() {
+        let text = "\
+M48
+;DRILL file {KiCad 8.0} NonPlated
+METRIC
+T1C1.000
+%
+G90
+G05
+T1
+G00X1.000Y2.000
+M15
+G01X4.000
+M16
+X5.000Y6.000
+M30
+";
+        let tools = parse_kicad(text);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].plating, Plating::NonPlated);
+        assert_eq!(tools[0].hits.len(), 2);
+        assert!(!tools[0].hits[0].is_hole());
+        assert!((tools[0].hits[0].to.0 - 4.0).abs() < 1e-9);
+        assert!((tools[0].hits[0].to.1 - 2.0).abs() < 1e-9);
+        assert!(tools[0].hits[1].is_hole());
+    }
+
+    #[test]
+    fn merging_groups_equal_diameters() {
+        let a = Tool {
+            diameter: 0.3,
+            plating: Plating::Plated,
+            hits: vec![Hit::hole(1.0, 2.0)],
+        };
+        let b = Tool {
+            diameter: 2.2,
+            plating: Plating::Plated,
+            hits: vec![Hit::hole(3.0, 4.0)],
+        };
+        let c = Tool {
+            diameter: 0.3000001,
+            plating: Plating::Plated,
+            hits: vec![Hit::hole(5.0, 6.0)],
+        };
+        let (pth, npth) = merge(vec![b, c, a]);
+        assert!(npth.is_empty());
+        assert_eq!(pth.len(), 2);
+        assert!((pth[0].diameter - 0.3).abs() < 1e-9);
+        assert_eq!(pth[0].hits.len(), 2);
+        assert_eq!(pth[1].hits.len(), 1);
+    }
+
+    #[test]
+    fn renders_holes_and_slots() {
+        let tools = vec![Tool {
+            diameter: 0.5,
+            plating: Plating::Plated,
+            hits: vec![Hit::hole(1.0, 2.0), Hit::slot((1.0, 2.0), (1.5, 2.0))],
+        }];
+        let out = render(
+            &tools,
+            Plating::Plated,
+            "EasyEDA v2.1.1.0, 2024-01-01 00:00:00",
         );
-    }
-
-    #[test]
-    fn parses_altium_non_plated_tools() {
-        let content = "M48\n;FILE_FORMAT=4:4\nMETRIC,LZ\n;TYPE=NON_PLATED\nT04F00S00C0.9000\n%\nT04\nX0010000Y0010000\nM30\n";
-        let tools = parse_altium(content);
-        assert_eq!(tools.len(), 1);
-        assert!(!tools[0].plated);
-    }
-
-    #[test]
-    fn parses_kicad_slots() {
-        let content = "# DRILL file {KiCad}\nM48\nMETRIC\nT1C0.500\n%\nG90\nG05\nT1\nG00X10.000Y10.000\nM15\nG01X12.000Y10.000\nM16\nM30\n";
-        let tools = parse_kicad(content);
-        assert_eq!(tools.len(), 1);
-        assert!(matches!(tools[0].hits[0], Hit::Slot { .. }));
+        assert!(out.starts_with(";TYPE=PLATED\n;Layer: PTH_Through\n"));
+        assert!(out.contains("M48\nMETRIC,LZ,0000.00000\n"));
+        assert!(out.contains(";Hole size 1 = 0.50000 METRIC\nT01C0.50000\n"));
+        assert!(out.contains("X1.00000Y2.00000\n"));
+        assert!(out.contains("X1.00000Y2.00000G85X1.50000Y2.00000\n"));
+        assert!(out.ends_with("M30\n"));
     }
 }
