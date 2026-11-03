@@ -100,5 +100,5 @@ impl Stamp {
 
 /// Ordering instructions shipped next to the converted layers.
 pub fn order_guide() -> &'static str {
-    "如何进行PCB下单\n\n请查看：\nhttps://prodocs.lceda.cn/cn/pcb/order-order-pcb/index.html"
+    "PCB 下单说明\n\n上传本压缩包即可下单。\n参考：\nhttps://prodocs.lceda.cn/cn/pcb/order-order-pcb/index.html"
 }

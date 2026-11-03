@@ -63,7 +63,7 @@ pub fn merge(sources: &[(String, String)], stamp: &mut banner::Stamp) -> Merge {
     for (name, content) in sources {
         if !is_through(name) {
             warnings.push(format!(
-                "Skipped blind/buried via file: {name}. JLC only supports through holes."
+                "skipping {name}: blind/buried vias are not supported, only through holes"
             ));
             continue;
         }
@@ -297,10 +297,10 @@ fn parse_altium(content: &str) -> Vec<Tool> {
             format = values;
         }
 
-        if line.contains("TYPE=PLATED") && !line.contains("NON_PLATED") {
-            plated = true;
-        } else if line.contains("TYPE=NON_PLATED") {
+        if line.contains("TYPE=NON_PLATED") {
             plated = false;
+        } else if line.contains("TYPE=PLATED") {
+            plated = true;
         }
 
         if let Some((number, diameter)) = altium_tool(line) {

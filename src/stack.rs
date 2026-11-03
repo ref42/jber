@@ -20,7 +20,7 @@ pub fn check(names: &[String]) -> Result<Stack, Vec<String>> {
 
     for prefix in REQUIRED {
         if !names.iter().any(|name| name.starts_with(prefix)) {
-            errors.push(format!("Missing required file starting with: '{prefix}'"));
+            errors.push(format!("required layer missing: {prefix}"));
         }
     }
 
@@ -37,50 +37,30 @@ pub fn check(names: &[String]) -> Result<Stack, Vec<String>> {
                 .iter()
                 .any(|error| error.contains("TopSolderMaskLayer"))
         {
-            errors.push(
-                "Top copper layer is present, but the required 'Gerber_TopSolderMaskLayer' is missing."
-                    .to_string(),
-            );
+            errors.push("top copper needs Gerber_TopSolderMaskLayer".to_string());
         }
         if !has(names, "Gerber_TopSilkscreenLayer") {
-            warnings.push(
-                "Warning: 'Gerber_TopSilkscreenLayer' is missing for the top side.".to_string(),
-            );
+            warnings.push("no top silkscreen layer".to_string());
         }
         if !has(names, "Gerber_TopPasteMaskLayer") {
-            warnings.push(
-                "Warning: 'Gerber_TopPasteMaskLayer' is missing. This is usually needed for SMD components."
-                    .to_string(),
-            );
+            warnings.push("no top paste layer (needed for SMD assembly)".to_string());
         }
     }
 
     if has_bottom {
         if !has(names, "Gerber_BottomSolderMaskLayer") {
-            errors.push(
-                "Bottom copper layer is present, but 'Gerber_BottomSolderMaskLayer' is missing."
-                    .to_string(),
-            );
+            errors.push("bottom copper needs Gerber_BottomSolderMaskLayer".to_string());
         }
         if !has(names, "Gerber_BottomSilkscreenLayer") {
-            warnings.push(
-                "Warning: 'Gerber_BottomSilkscreenLayer' is missing for the bottom side."
-                    .to_string(),
-            );
+            warnings.push("no bottom silkscreen layer".to_string());
         }
         if !has(names, "Gerber_BottomPasteMaskLayer") {
-            warnings.push(
-                "Warning: 'Gerber_BottomPasteMaskLayer' is missing for the bottom side."
-                    .to_string(),
-            );
+            warnings.push("no bottom paste layer".to_string());
         }
     }
 
     if has_top && inner > 0 && !has_bottom {
-        errors.push(
-            "Invalid layer stackup: A board with top and inner copper layers must also have a bottom copper layer."
-                .to_string(),
-        );
+        errors.push("invalid stackup: top and inner copper require a bottom layer".to_string());
     }
 
     if !errors.is_empty() {
