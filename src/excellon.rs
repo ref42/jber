@@ -55,7 +55,7 @@ fn is_through(name: &str) -> bool {
     !is_numbered(&name.to_ascii_lowercase())
 }
 
-pub fn merge(sources: &[(String, String)]) -> Merge {
+pub fn merge(sources: &[(String, String)], stamp: &mut banner::Stamp) -> Merge {
     let mut plated: BTreeMap<u64, Tool> = BTreeMap::new();
     let mut non_plated: BTreeMap<u64, Tool> = BTreeMap::new();
     let mut warnings = Vec::new();
@@ -92,13 +92,13 @@ pub fn merge(sources: &[(String, String)]) -> Merge {
     }
 
     Merge {
-        plated: emit(&plated, true),
-        non_plated: emit(&non_plated, false),
+        plated: emit(&plated, true, stamp),
+        non_plated: emit(&non_plated, false, stamp),
         warnings,
     }
 }
 
-fn emit(tools: &BTreeMap<u64, Tool>, plated: bool) -> Option<String> {
+fn emit(tools: &BTreeMap<u64, Tool>, plated: bool, stamp: &mut banner::Stamp) -> Option<String> {
     if tools.is_empty() {
         return None;
     }
@@ -109,7 +109,7 @@ fn emit(tools: &BTreeMap<u64, Tool>, plated: bool) -> Option<String> {
         ("NON_PLATED", "NPTH_Through")
     };
 
-    let mut output = banner::drill_header(hole_type, layer);
+    let mut output = stamp.drill_header(hole_type, layer);
     output.push_str("M48\nMETRIC,LZ,0000.00000\n");
 
     for (index, tool) in tools.values().enumerate() {

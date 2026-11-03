@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::eda::Eda;
-use crate::pipeline::Conversion;
+use crate::pipeline::{Conversion, Output, PlaneMode, Settings};
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
@@ -26,15 +26,19 @@ const USAGE: &str = "\
 jerber — convert a Gerber archive into a JLCPCB-ready set
 
 USAGE:
-    jerber <INPUT.zip|DIR> [-o OUTPUT] [-q|--quiet]
+    jerber <INPUT.zip|DIR> [-o OUTPUT] [-q|--quiet] [OPTIONS]
 
 OPTIONS:
-    -o, --out <PATH>   Output path. A *.zip path is written as an archive, any
-                       other path as a folder. Default: <input>-<AD|Ki|ED>-L<layers>.zip
-                       next to the input.
-    -q, --quiet        Print the summary only
-    -h, --help         Show this help
-    -V, --version      Show the version
+    -o, --out <PATH>    Output path. A *.zip path is written as an archive, any
+                        other path as a folder. Default: <input>-<AD|Ki|ED>-L<layers>.zip
+                        next to the input.
+    -q, --quiet         Print the summary only
+        --clean         Keep only manufacturing layers, drills and the guide
+        --force         Overwrite an existing output file
+        --planes <MODE> Negative-plane handling: \"warn\" (default) or \"positive\"
+        --seed <N>      Deterministic headers/watermark (also honours SOURCE_DATE_EPOCH)
+    -h, --help          Show this help
+    -V, --version       Show the version
 ";
 
 fn main() -> ExitCode {
@@ -62,16 +66,34 @@ struct Options {
     input: PathBuf,
     out: Option<PathBuf>,
     quiet: bool,
+    clean: bool,
+    force: bool,
+    planes: PlaneMode,
+    seed: Option<u64>,
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, String> {
     let mut input: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut quiet = false;
+    let mut clean = false;
+    let mut force = false;
+    let mut planes = PlaneMode::Warn;
+    let mut seed: Option<u64> = None;
     let mut args = args.peekable();
 
     while let Some(arg) = args.next() {
-        match arg.as_str() {
+        // Long options accept both "--flag value" and "--flag=value".
+        let (flag, inline) = if arg.starts_with("--") {
+            match arg.split_once('=') {
+                Some((flag, value)) => (flag.to_string(), Some(value.to_string())),
+                None => (arg.clone(), None),
+            }
+        } else {
+            (arg.clone(), None)
+        };
+
+        match flag.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return Ok(None);
@@ -81,11 +103,30 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
                 return Ok(None);
             }
             "-q" | "--quiet" => quiet = true,
+            "--clean" => clean = true,
+            "--force" => force = true,
             "-o" | "--out" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| format!("{arg} requires a path"))?;
-                out = Some(PathBuf::from(value));
+                out = Some(PathBuf::from(take_value(&flag, inline, &mut args)?));
+            }
+            "--planes" => {
+                let value = take_value(&flag, inline, &mut args)?;
+                planes = match value.as_str() {
+                    "warn" => PlaneMode::Warn,
+                    "positive" => PlaneMode::Positive,
+                    other => {
+                        return Err(format!(
+                            "unknown plane mode: {other} (expected warn or positive)"
+                        ));
+                    }
+                };
+            }
+            "--seed" => {
+                let value = take_value(&flag, inline, &mut args)?;
+                seed = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("invalid seed: {value}"))?,
+                );
             }
             other if other.starts_with('-') && other.len() > 1 => {
                 return Err(format!("unknown option: {other}"));
@@ -100,7 +141,27 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
     }
 
     let input = input.ok_or_else(|| "missing input archive".to_string())?;
-    Ok(Some(Options { input, out, quiet }))
+    Ok(Some(Options {
+        input,
+        out,
+        quiet,
+        clean,
+        force,
+        planes,
+        seed,
+    }))
+}
+
+fn take_value<I: Iterator<Item = String>>(
+    flag: &str,
+    inline: Option<String>,
+    args: &mut std::iter::Peekable<I>,
+) -> Result<String, String> {
+    if let Some(value) = inline {
+        return Ok(value);
+    }
+    args.next()
+        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 // --- Driver ----------------------------------------------------------------
@@ -114,17 +175,39 @@ fn run(options: &Options) -> Result<(), String> {
         ));
     }
 
-    let conversion = pipeline::convert(files)?;
+    let settings = Settings {
+        seed: options.seed,
+        epoch: options.seed.map(|_| source_date_epoch()),
+        planes: options.planes,
+        clean: options.clean,
+    };
+
+    let conversion = pipeline::convert(files, &settings)?;
 
     let out_path = options
         .out
         .clone()
         .unwrap_or_else(|| default_output(&options.input, conversion.eda, conversion.layers));
 
+    if out_path.exists() && !options.force {
+        return Err(format!(
+            "{} already exists (use --force to overwrite)",
+            out_path.display()
+        ));
+    }
+
     write_output(&out_path, &conversion.outputs)?;
 
     report(options, &conversion, &out_path);
     Ok(())
+}
+
+/// Reproducible-builds convention: lets callers pin the header timestamp.
+fn source_date_epoch() -> i64 {
+    std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
 }
 
 fn default_output(input: &Path, eda: Eda, layers: u32) -> PathBuf {
@@ -141,7 +224,7 @@ fn default_output(input: &Path, eda: Eda, layers: u32) -> PathBuf {
 
 // --- Input -----------------------------------------------------------------
 
-fn load(input: &Path) -> Result<BTreeMap<String, String>, String> {
+fn load(input: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
     if input.is_dir() {
         load_dir(input)
     } else if input.is_file() {
@@ -151,7 +234,7 @@ fn load(input: &Path) -> Result<BTreeMap<String, String>, String> {
     }
 }
 
-fn load_dir(directory: &Path) -> Result<BTreeMap<String, String>, String> {
+fn load_dir(directory: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut files = BTreeMap::new();
 
     for entry in
@@ -168,16 +251,13 @@ fn load_dir(directory: &Path) -> Result<BTreeMap<String, String>, String> {
             continue;
         }
         let bytes = fs::read(&path).map_err(|e| format!("cannot read {name}: {e}"))?;
-        files.insert(
-            name.to_string(),
-            String::from_utf8_lossy(&bytes).into_owned(),
-        );
+        files.insert(name.to_string(), bytes);
     }
 
     Ok(files)
 }
 
-fn load_zip(path: &Path) -> Result<BTreeMap<String, String>, String> {
+fn load_zip(path: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     let mut archive = ZipArchive::new(file)
         .map_err(|e| format!("{} is not a readable zip: {e}", path.display()))?;
@@ -209,10 +289,7 @@ fn load_zip(path: &Path) -> Result<BTreeMap<String, String>, String> {
         entry
             .read_to_end(&mut bytes)
             .map_err(|e| format!("cannot read {name}: {e}"))?;
-        files.insert(
-            name.to_string(),
-            String::from_utf8_lossy(&bytes).into_owned(),
-        );
+        files.insert(name.to_string(), bytes);
     }
 
     Ok(files)
@@ -225,7 +302,7 @@ fn is_junk(name: &str) -> bool {
 
 // --- Output ----------------------------------------------------------------
 
-fn write_output(path: &Path, outputs: &[(String, String)]) -> Result<(), String> {
+fn write_output(path: &Path, outputs: &[Output]) -> Result<(), String> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -244,18 +321,18 @@ fn write_output(path: &Path, outputs: &[(String, String)]) -> Result<(), String>
     }
 }
 
-fn write_zip(path: &Path, outputs: &[(String, String)]) -> Result<(), String> {
+fn write_zip(path: &Path, outputs: &[Output]) -> Result<(), String> {
     let file = File::create(path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
     let mut writer = ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
-    for (name, content) in outputs {
+    for output in outputs {
         writer
-            .start_file(name.as_str(), options)
-            .map_err(|e| format!("cannot add {name}: {e}"))?;
+            .start_file(output.name.as_str(), options)
+            .map_err(|e| format!("cannot add {}: {e}", output.name))?;
         writer
-            .write_all(content.as_bytes())
-            .map_err(|e| format!("cannot write {name}: {e}"))?;
+            .write_all(&output.data)
+            .map_err(|e| format!("cannot write {}: {e}", output.name))?;
     }
 
     writer
@@ -264,13 +341,13 @@ fn write_zip(path: &Path, outputs: &[(String, String)]) -> Result<(), String> {
     Ok(())
 }
 
-fn write_dir(directory: &Path, outputs: &[(String, String)]) -> Result<(), String> {
+fn write_dir(directory: &Path, outputs: &[Output]) -> Result<(), String> {
     fs::create_dir_all(directory)
         .map_err(|e| format!("cannot create {}: {e}", directory.display()))?;
 
-    for (name, content) in outputs {
-        fs::write(directory.join(name), content)
-            .map_err(|e| format!("cannot write {name}: {e}"))?;
+    for output in outputs {
+        fs::write(directory.join(&output.name), &output.data)
+            .map_err(|e| format!("cannot write {}: {e}", output.name))?;
     }
     Ok(())
 }
@@ -301,6 +378,9 @@ fn report(options: &Options, conversion: &Conversion, out_path: &Path) {
         conversion.drill_sources
     );
     println!("Added     order guide");
+    if options.clean {
+        println!("Cleaned   reports and drawings removed");
+    }
     println!();
 
     if !options.quiet {
@@ -328,22 +408,44 @@ mod tests {
         items.iter().map(|item| item.to_string()).collect()
     }
 
+    fn parse(items: &[&str]) -> Options {
+        parse_args(args(items).into_iter()).unwrap().unwrap()
+    }
+
     #[test]
     fn parses_input_and_output() {
-        let options = parse_args(args(&["board.zip", "-o", "out.zip"]).into_iter())
-            .unwrap()
-            .unwrap();
+        let options = parse(&["board.zip", "-o", "out.zip"]);
         assert_eq!(options.input, Path::new("board.zip"));
         assert_eq!(options.out.as_deref(), Some(Path::new("out.zip")));
         assert!(!options.quiet);
+        assert_eq!(options.planes, PlaneMode::Warn);
+    }
+
+    #[test]
+    fn parses_processing_flags() {
+        let options = parse(&[
+            "--clean",
+            "--force",
+            "--planes",
+            "positive",
+            "--seed",
+            "7",
+            "board.zip",
+        ]);
+        assert!(options.clean);
+        assert!(options.force);
+        assert_eq!(options.planes, PlaneMode::Positive);
+        assert_eq!(options.seed, Some(7));
+    }
+
+    #[test]
+    fn rejects_bad_plane_mode() {
+        assert!(parse_args(args(&["--planes", "maybe", "board.zip"]).into_iter()).is_err());
     }
 
     #[test]
     fn quiet_flag_is_accepted() {
-        let options = parse_args(args(&["-q", "board.zip"]).into_iter())
-            .unwrap()
-            .unwrap();
-        assert!(options.quiet);
+        assert!(parse(&["-q", "board.zip"]).quiet);
     }
 
     #[test]

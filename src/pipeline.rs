@@ -1,17 +1,51 @@
 /* src/pipeline.rs */
 
-//! Conversion pipeline: name mapping, header stamping, D-code normalization,
-//! drill merging and stack validation.
+//! Conversion pipeline: name mapping, plane polarity, header stamping, D-code
+//! normalization, drill merging and stack validation.
 
 use std::collections::BTreeMap;
 
+use crate::banner::Stamp;
 use crate::eda::{self, Eda};
 use crate::{banner, excellon, gerber, naming, stack, watermark};
 
 pub const GUIDE_NAME: &str = "PCB下单必读.txt";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaneMode {
+    /// Keep the vendor's negative image and warn about it.
+    Warn,
+    /// Re-emit negative planes as positive images.
+    Positive,
+}
+
+pub struct Settings {
+    pub seed: Option<u64>,
+    pub epoch: Option<i64>,
+    pub planes: PlaneMode,
+    pub clean: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            seed: None,
+            epoch: None,
+            planes: PlaneMode::Warn,
+            clean: false,
+        }
+    }
+}
+
+pub struct Output {
+    pub name: String,
+    pub data: Vec<u8>,
+    /// True for layers/drill files that belong in a manufacturing upload.
+    pub plot: bool,
+}
+
 pub struct Conversion {
-    pub outputs: Vec<(String, String)>,
+    pub outputs: Vec<Output>,
     pub mapping: BTreeMap<String, String>,
     pub warnings: Vec<String>,
     pub eda: Eda,
@@ -21,16 +55,17 @@ pub struct Conversion {
     pub drill_sources: usize,
 }
 
-pub fn convert(files: BTreeMap<String, String>) -> Result<Conversion, String> {
+pub fn convert(
+    files: BTreeMap<String, Vec<u8>>,
+    settings: &Settings,
+) -> Result<Conversion, String> {
     let names: Vec<String> = files.keys().cloned().collect();
 
     let mut software: BTreeMap<&str, Option<Eda>> = BTreeMap::new();
     for name in &names {
-        let head: String = files[name]
-            .split('\n')
-            .take(10)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let bytes = &files[name];
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
+        let head: String = head.split('\n').take(10).collect::<Vec<_>>().join("\n");
         software.insert(name, eda::detect(&head));
     }
 
@@ -46,48 +81,97 @@ pub fn convert(files: BTreeMap<String, String>) -> Result<Conversion, String> {
     })?;
 
     let mapping = naming::plan(&names, primary_eda);
-    let header = banner::gerber_header();
+    let outline_frame = outline_frame(&mapping, &files);
 
-    let mut outputs: Vec<(String, String)> = Vec::new();
+    let mut stamp = Stamp::new(settings.seed, settings.epoch);
+    let mut outputs: Vec<Output> = Vec::new();
     let mut drill_sources: Vec<(String, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
     for name in &names {
         let renamed = mapping.get(name).cloned().unwrap_or_else(|| name.clone());
+        let raw = &files[name];
 
         if excellon::is_drill_file(name) {
-            drill_sources.push((name.clone(), files[name].replace("\r\n", "\n")));
+            drill_sources.push((name.clone(), decode(raw)));
             continue;
         }
 
-        // Not every file in an archive is a plot: reports and drawings are
-        // carried through unchanged.
-        let mut content = files[name].replace("\r\n", "\n");
-        if let Some(source) = software[name.as_str()] {
-            content = format!("{header}{content}");
-            content = gerber::normalize_dcodes(&content, flavor(source));
-            content = watermark::embed(&content, false);
+        let Some(source) = software[name.as_str()] else {
+            // Not a plot: reports, drawings and unknown attachments keep their
+            // bytes and their name.
+            outputs.push(Output {
+                name: renamed.clone(),
+                data: raw.clone(),
+                plot: is_plot(&renamed),
+            });
+            continue;
+        };
+
+        let mut content = decode(raw);
+
+        // Altium marks solder-mask layers as negative too, but that is the
+        // normal way to plot mask openings; only inner planes are genuinely
+        // inverted images that a fab may misinterpret.
+        if renamed.starts_with("Gerber_InnerLayer") && gerber::is_negative(&content) {
+            if settings.planes == PlaneMode::Positive {
+                if let Some(frame) = outline_frame {
+                    content = gerber::to_positive(&content, &frame);
+                } else {
+                    warnings.push(format!(
+                        "{name} is a negative plane layer, but no outline was available to convert it; leaving it as is"
+                    ));
+                }
+            } else {
+                warnings.push(format!(
+                    "{name} is a negative plane layer ({renamed}); many fabs ignore TF.FilePolarity — re-export it as positive or rerun with --planes=positive"
+                ));
+            }
         }
 
-        outputs.push((renamed, content));
+        content = format!("{}{content}", stamp.gerber_header());
+        content = gerber::normalize_dcodes(&content, flavor(source));
+        content = watermark::embed(&content, false);
+
+        outputs.push(Output {
+            name: renamed.clone(),
+            data: content.into_bytes(),
+            plot: is_plot(&renamed),
+        });
     }
 
-    let merged = excellon::merge(&drill_sources);
+    let merged = excellon::merge(&drill_sources, &mut stamp);
     warnings.extend(merged.warnings);
     if let Some(plated) = merged.plated {
-        outputs.push(("Drill_PTH_Through.DRL".to_string(), plated));
+        outputs.push(Output {
+            name: "Drill_PTH_Through.DRL".to_string(),
+            data: plated.into_bytes(),
+            plot: true,
+        });
     }
     if let Some(non_plated) = merged.non_plated {
-        outputs.push(("Drill_NPTH_Through.DRL".to_string(), non_plated));
+        outputs.push(Output {
+            name: "Drill_NPTH_Through.DRL".to_string(),
+            data: non_plated.into_bytes(),
+            plot: true,
+        });
     }
 
-    let final_names: Vec<String> = outputs.iter().map(|(name, _)| name.clone()).collect();
+    let final_names: Vec<String> = outputs.iter().map(|output| output.name.clone()).collect();
     let stack = stack::check(&final_names)
         .map_err(|errors| format!("gerber validation failed:\n  - {}", errors.join("\n  - ")))?;
     warnings.extend(stack.warnings);
 
-    if !outputs.iter().any(|(name, _)| name == GUIDE_NAME) {
-        outputs.push((GUIDE_NAME.to_string(), banner::order_guide().to_string()));
+    if !outputs.iter().any(|output| output.name == GUIDE_NAME) {
+        outputs.push(Output {
+            name: GUIDE_NAME.to_string(),
+            data: banner::order_guide().as_bytes().to_vec(),
+            plot: false,
+        });
+    }
+
+    if settings.clean {
+        outputs.retain(|output| output.plot || output.name == GUIDE_NAME);
     }
 
     let (renamed, kept) = names
@@ -113,9 +197,280 @@ pub fn convert(files: BTreeMap<String, String>) -> Result<Conversion, String> {
     })
 }
 
+/// Artwork extent of the outline layer, used to paint planes when converting
+/// them from negative to positive.
+fn outline_frame(
+    mapping: &BTreeMap<String, String>,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Option<gerber::Frame> {
+    let (source, _) = mapping
+        .iter()
+        .find(|(_, renamed)| renamed.as_str() == "Gerber_BoardOutlineLayer.GKO")?;
+
+    let content = files.get(source)?;
+    gerber::frame(&decode(content))
+}
+
+fn decode(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).replace("\r\n", "\n")
+}
+
 fn flavor(source: Eda) -> gerber::Flavor {
     match source {
         Eda::KiCad => gerber::Flavor::KiCad,
         Eda::Altium | Eda::EasyEDA => gerber::Flavor::Altium,
+    }
+}
+
+/// Manufacturing layers and drills, as opposed to reports and drawings.
+fn is_plot(name: &str) -> bool {
+    if name == "Drill_PTH_Through.DRL" || name == "Drill_NPTH_Through.DRL" {
+        return true;
+    }
+
+    const SUFFIXES: [&str; 15] = [
+        ".GTL", ".GTO", ".GTS", ".GTP", ".GBL", ".GBO", ".GBS", ".GBP", ".G1", ".G2", ".G3", ".G4",
+        ".G5", ".G6", ".GKO",
+    ];
+
+    let upper = name.to_ascii_uppercase();
+    upper.starts_with("GERBER_") && SUFFIXES.iter().any(|suffix| upper.ends_with(suffix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(value: &str) -> Vec<u8> {
+        value.as_bytes().to_vec()
+    }
+
+    fn altium_layer() -> Vec<u8> {
+        text(
+            "G04 #@! TF.GenerationSoftware,Altium Limited,Altium Designer,26.9.1*\n%FSLAX44Y44*%\n%MOMM*%\n%ADD10C,0.2000*%\nD10*\nX0Y0D02*\nX100000D01*\nM02*\n",
+        )
+    }
+
+    fn altium_outline() -> Vec<u8> {
+        text(
+            "G04 #@! TF.GenerationSoftware,Altium Limited,Altium Designer,26.9.1*\n%FSLAX44Y44*%\n%MOMM*%\n%ADD10C,0.0500*%\nD10*\nX0Y0D02*\nX400000D01*\nY400000D01*\nX0D01*\nY0D01*\nM02*\n",
+        )
+    }
+
+    fn altium_plane() -> Vec<u8> {
+        text(
+            "G04 #@! TF.GenerationSoftware,Altium Limited,Altium Designer,26.9.1*\n%FSLAX44Y44*%\n%MOMM*%\n%ADD88C,0.9000*%\nG04 #@! TF.FilePolarity,Negative*\nG36*\nX100000Y100000D02*\nX200000D01*\nY200000D01*\nX100000D01*\nY100000D01*\nD02*\nG37*\nD88*\nX150000Y150000D02*\nD03*\nM02*\n",
+        )
+    }
+
+    fn altium_files() -> BTreeMap<String, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        files.insert("main.GTL".to_string(), altium_layer());
+        files.insert("main.GBL".to_string(), altium_layer());
+        files.insert("main.GTS".to_string(), altium_layer());
+        files.insert("main.GBS".to_string(), altium_layer());
+        files.insert("main.GM".to_string(), altium_outline());
+        files.insert("main.GP1".to_string(), altium_plane());
+        files.insert("main.GP2".to_string(), altium_plane());
+        files.insert(
+            "main-RoundHoles.TXT".to_string(),
+            text("M48\n;FILE_FORMAT=4:4\nMETRIC,LZ\n;TYPE=PLATED\nT01F00S00C0.3000\n;TYPE=NON_PLATED\nT04F00S00C0.9000\n%\nT01\nX0010000Y0010000\nT04\nX0020000Y0020000\nM30\n"),
+        );
+        files.insert(
+            "main-SlotHoles.TXT".to_string(),
+            text("M48\n;FILE_FORMAT=4:4\nMETRIC,LZ\n;TYPE=PLATED\nT02F00S00C0.5000\n%\nG90\nG05\nT02\nG00X0010000Y0010000\nM15\nG01X0020000Y0020000\nM16\nM30\n"),
+        );
+        files.insert(
+            "Design Rule Check - main.html".to_string(),
+            text("<html>report</html>"),
+        );
+        files.insert("binary.dat".to_string(), vec![0x00, 0x9f, 0x92, 0x96]);
+        files
+    }
+
+    fn find<'a>(conversion: &'a Conversion, name: &str) -> &'a Output {
+        conversion
+            .outputs
+            .iter()
+            .find(|output| output.name == name)
+            .unwrap_or_else(|| panic!("missing output {name}"))
+    }
+
+    #[test]
+    fn converts_an_altium_board_with_planes() {
+        let settings = Settings {
+            seed: Some(1),
+            epoch: Some(0),
+            ..Default::default()
+        };
+        let conversion = convert(altium_files(), &settings).expect("convert");
+
+        assert_eq!(conversion.layers, 4);
+        assert_eq!(conversion.mapping["main.GP1"], "Gerber_InnerLayer1.G1");
+        assert_eq!(conversion.mapping["main.GP2"], "Gerber_InnerLayer2.G2");
+        assert_eq!(
+            conversion.mapping["main.GM"],
+            "Gerber_BoardOutlineLayer.GKO"
+        );
+
+        let top =
+            String::from_utf8(find(&conversion, "Gerber_TopLayer.GTL").data.clone()).expect("utf8");
+        assert!(top.starts_with("G04 EasyEDA"));
+        assert!(top.contains("G54D10*"));
+
+        let drill = String::from_utf8(find(&conversion, "Drill_PTH_Through.DRL").data.clone())
+            .expect("utf8");
+        assert!(drill.contains("X10.00000Y10.00000"));
+        assert!(drill.contains("G85"));
+
+        let npth = String::from_utf8(find(&conversion, "Drill_NPTH_Through.DRL").data.clone())
+            .expect("utf8");
+        assert!(npth.contains("X20.00000Y20.00000"));
+
+        assert!(
+            conversion
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("negative plane")),
+            "expected a negative-plane warning, got {:?}",
+            conversion.warnings
+        );
+    }
+
+    #[test]
+    fn keeps_attachment_bytes_untouched() {
+        let settings = Settings {
+            seed: Some(1),
+            epoch: Some(0),
+            ..Default::default()
+        };
+        let conversion = convert(altium_files(), &settings).expect("convert");
+        let binary = find(&conversion, "binary.dat");
+        assert_eq!(binary.data, vec![0x00, 0x9f, 0x92, 0x96]);
+        assert!(!binary.plot);
+    }
+
+    #[test]
+    fn converts_planes_to_positive_on_request() {
+        let settings = Settings {
+            seed: Some(1),
+            epoch: Some(0),
+            planes: PlaneMode::Positive,
+            clean: false,
+        };
+        let conversion = convert(altium_files(), &settings).expect("convert");
+        let plane = String::from_utf8(find(&conversion, "Gerber_InnerLayer1.G1").data.clone())
+            .expect("utf8");
+
+        assert!(plane.contains("%LPC*%"));
+        assert!(plane.contains("%LPD*%"));
+        assert!(!plane.contains("Negative"));
+        assert!(plane.ends_with("%LPD*%\nM02*\n"));
+    }
+
+    #[test]
+    fn clean_drops_reports_but_keeps_plots() {
+        let settings = Settings {
+            clean: true,
+            ..Default::default()
+        };
+        let conversion = convert(altium_files(), &settings).expect("convert");
+
+        assert!(
+            conversion
+                .outputs
+                .iter()
+                .all(|output| output.plot || output.name == GUIDE_NAME)
+        );
+        assert!(
+            conversion
+                .outputs
+                .iter()
+                .any(|output| output.name == "Gerber_TopLayer.GTL")
+        );
+        assert!(
+            conversion
+                .outputs
+                .iter()
+                .any(|output| output.name == "PCB下单必读.txt")
+        );
+    }
+
+    #[test]
+    fn the_same_seed_reproduces_the_archive() {
+        let settings = Settings {
+            seed: Some(42),
+            epoch: Some(1_600_000_000),
+            ..Default::default()
+        };
+
+        let first = convert(altium_files(), &settings).expect("convert");
+        let second = convert(altium_files(), &settings).expect("convert");
+
+        assert_eq!(first.outputs.len(), second.outputs.len());
+        for (left, right) in first.outputs.iter().zip(second.outputs.iter()) {
+            assert_eq!(left.name, right.name);
+            assert_eq!(left.data, right.data);
+        }
+
+        let other = Settings {
+            seed: Some(43),
+            epoch: Some(1_600_000_000),
+            ..Default::default()
+        };
+        let third = convert(altium_files(), &other).expect("convert");
+        assert_ne!(
+            find(&first, "Gerber_TopLayer.GTL").data,
+            find(&third, "Gerber_TopLayer.GTL").data
+        );
+    }
+
+    #[test]
+    fn converts_a_kicad_board_and_splits_drills() {
+        let header = "G04 #@! TF.GenerationSoftware,KiCad,Pcbnew,8.0.1*\n%FSLAX46Y46*%\n%MOMM*%\n";
+        let mut files = BTreeMap::new();
+        for layer in [
+            "F_Cu",
+            "B_Cu",
+            "F_Mask",
+            "B_Mask",
+            "F_Silkscreen",
+            "B_Silkscreen",
+        ] {
+            files.insert(
+                format!("board-{layer}.gbr"),
+                text(&format!("{header}%ADD10C,0.2000*%\nD10*\nX0Y0D02*\nM02*\n")),
+            );
+        }
+        files.insert(
+            "board-Edge_Cuts.gbr".to_string(),
+            text(&format!(
+                "{header}G01*\nG75*\n%ADD10C,0.0500*%\nD10*\nX0Y0D02*\nX100000000D01*\nY100000000D01*\nX0D01*\nY0D01*\nM02*\n"
+            )),
+        );
+        files.insert(
+            "board-PTH.drl".to_string(),
+            text("M48\n;DRILL file {KiCad 8.0.1}\nMETRIC\nT1C0.800\n%\nG90\nG05\nT1\nX10.500Y20.500\nM30\n"),
+        );
+        files.insert(
+            "board-NPTH.drl".to_string(),
+            text("M48\n;DRILL file {KiCad 8.0.1}\n; NPTH\nMETRIC\nT1C3.200\n%\nG90\nG05\nT1\nX5.000Y5.000\nM30\n"),
+        );
+
+        let conversion = convert(files, &Settings::default()).expect("convert");
+        assert_eq!(conversion.layers, 2);
+        assert_eq!(
+            conversion.mapping["board-Edge_Cuts.gbr"],
+            "Gerber_BoardOutlineLayer.GKO"
+        );
+        assert_eq!(conversion.mapping["board-F_Cu.gbr"], "Gerber_TopLayer.GTL");
+
+        let pth = String::from_utf8(find(&conversion, "Drill_PTH_Through.DRL").data.clone())
+            .expect("utf8");
+        assert!(pth.contains("X10.50000Y20.50000"));
+
+        let npth = String::from_utf8(find(&conversion, "Drill_NPTH_Through.DRL").data.clone())
+            .expect("utf8");
+        assert!(npth.contains("X5.00000Y5.00000"));
     }
 }
