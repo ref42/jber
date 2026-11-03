@@ -21,7 +21,7 @@ impl Eda {
         }
     }
 
-    /// Two letter tag used in the default output file name.
+    /// Simple letter tag used in the default output file name.
     pub fn tag(self) -> &'static str {
         match self {
             Eda::Altium => "Altium",
