@@ -1,5 +1,5 @@
-﻿[package]
-name = "jerber"
+[package]
+name = "jber"
 version = "0.5.0"
 edition = "2024"
 description = "Turn Altium, KiCad and EasyEDA Gerber archives into JLCPCB-ready sets"

@@ -1,6 +1,6 @@
 /* src/main.rs */
 
-//! `jerber` — convert a Gerber archive into a JLCPCB-ready set.
+//! `jber` — convert a Gerber archive into a JLCPCB-ready set.
 
 mod eda;
 mod excellon;
@@ -18,10 +18,10 @@ use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
 const USAGE: &str = "\
-jerber — convert a Gerber archive into a JLCPCB-ready set
+jber — convert a Gerber archive into a JLCPCB-ready set
 
 USAGE:
-    jerber <INPUT.zip|DIR> [-o OUTPUT] [-q|--quiet] [OPTIONS]
+    jber <INPUT.zip|DIR> [-o OUTPUT] [-q|--quiet] [OPTIONS]
 
 OPTIONS:
     -o, --out <PATH>    Output path. A *.zip path is written as an archive, any
@@ -39,7 +39,7 @@ fn main() -> ExitCode {
         Ok(Some(options)) => options,
         Ok(None) => return ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("jerber: {error}\n\n{USAGE}");
+            eprintln!("jber: {error}\n\n{USAGE}");
             return ExitCode::FAILURE;
         }
     };
@@ -47,7 +47,7 @@ fn main() -> ExitCode {
     match run(&options) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("jerber: {error}");
+            eprintln!("jber: {error}");
             ExitCode::FAILURE
         }
     }
@@ -88,7 +88,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
                 return Ok(None);
             }
             "-V" | "--version" => {
-                println!("jerber {}", env!("CARGO_PKG_VERSION"));
+                println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
             "-q" | "--quiet" => quiet = true,

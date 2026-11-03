@@ -1,10 +1,10 @@
-# jerber — clean-room conversion specification
+# jber — clean-room conversion specification
 
 This document specifies the behaviour of a Gerber post-processor for JLCPCB
 orders. It is the **only** input an implementer may use. Do not consult any
 existing implementation (in particular, nothing under
 `C:\Users\Admin\Desktop\nextjlc` or the engine files in
-`C:\Users\Admin\Desktop\jerber\src`); the CLI wrapper `src/main.rs` in this
+`C:\Users\Admin\Desktop\jber\src`); the CLI wrapper `src/main.rs` in this
 crate is provided as-is and may be read only to learn the API it expects.
 
 The implementation must be original Rust code written from this document. The

@@ -327,7 +327,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "jerber"
+name = "jber"
 version = "0.5.0"
 dependencies = [
  "chrono",
