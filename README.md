@@ -10,18 +10,38 @@ jerber meas Just Gerber or JLC Gerber.
 ## Usage
 
 ```sh
-# Convert an archive; the result is written next to the input
+# Convert an archive. The suffix is the EDA detected from the file contents,
+# not assumed from the archive name:
 jerber GERBER.zip
-# -> GERBER-AD-L4.zip
+# -> GERBER-<AD|Ki|ED>-L<layers>.zip
+#    AD = Altium, Ki = KiCad, ED = EasyEDA, L<n> = copper layer count
 
-# Choose the output path (anything that is not *.zip is written as a folder)
+# Choose the output path (anything that is not *.zip is written as a folder):
 jerber GERBER.zip -o NEW_GERBER.zip
-
-# Convert an already extracted directory
+jerber GERBER.zip --out NEW_GERBER.zip
 jerber ./gerbers -o ./new_gerbers.zip
 
-# Script-friendly: no per-file report
+# Keep only manufacturing layers, merged drills and the order guide:
+jerber GERBER.zip --clean
+
+# Negative inner planes: warn (default) or re-emit them as positive images:
+jerber GERBER.zip --planes warn
+jerber GERBER.zip --planes positive
+
+# Reproducible output (headers + watermark); timestamp comes from
+# SOURCE_DATE_EPOCH when set:
+jerber GERBER.zip --seed 7 -o repeatable.zip
+
+# Overwrite an existing output:
+jerber GERBER.zip -o NEW_GERBER.zip --force
+
+# Summary only:
 jerber GERBER.zip -q
+jerber GERBER.zip --quiet
+
+# Help and version:
+jerber --help
+jerber --version
 ```
 
 ## License
