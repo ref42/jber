@@ -24,10 +24,6 @@ jerber ./gerbers -o ./new_gerbers.zip
 # Keep only manufacturing layers, merged drills and the order guide:
 jerber GERBER.zip --clean
 
-# Negative inner planes: warn (default) or re-emit them as positive images:
-jerber GERBER.zip --planes warn
-jerber GERBER.zip --planes positive
-
 # Reproducible output (headers + watermark); timestamp comes from
 # SOURCE_DATE_EPOCH when set:
 jerber GERBER.zip --seed 7 -o repeatable.zip

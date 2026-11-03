@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::eda::Eda;
-use crate::pipeline::{Conversion, Output, PlaneMode, Settings};
+use crate::pipeline::{Conversion, Output, Settings};
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
@@ -35,7 +35,6 @@ OPTIONS:
     -q, --quiet         Print the summary only
         --clean         Keep only manufacturing layers, drills and the guide
         --force         Overwrite an existing output file
-        --planes <MODE> Negative-plane handling: \"warn\" (default) or \"positive\"
         --seed <N>      Deterministic headers/watermark (also honours SOURCE_DATE_EPOCH)
     -h, --help          Show this help
     -V, --version       Show the version
@@ -68,7 +67,6 @@ struct Options {
     quiet: bool,
     clean: bool,
     force: bool,
-    planes: PlaneMode,
     seed: Option<u64>,
 }
 
@@ -78,7 +76,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
     let mut quiet = false;
     let mut clean = false;
     let mut force = false;
-    let mut planes = PlaneMode::Warn;
     let mut seed: Option<u64> = None;
     let mut args = args.peekable();
 
@@ -108,18 +105,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
             "-o" | "--out" => {
                 out = Some(PathBuf::from(take_value(&flag, inline, &mut args)?));
             }
-            "--planes" => {
-                let value = take_value(&flag, inline, &mut args)?;
-                planes = match value.as_str() {
-                    "warn" => PlaneMode::Warn,
-                    "positive" => PlaneMode::Positive,
-                    other => {
-                        return Err(format!(
-                            "unknown plane mode: {other} (expected warn or positive)"
-                        ));
-                    }
-                };
-            }
             "--seed" => {
                 let value = take_value(&flag, inline, &mut args)?;
                 seed = Some(
@@ -147,7 +132,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
         quiet,
         clean,
         force,
-        planes,
         seed,
     }))
 }
@@ -178,7 +162,6 @@ fn run(options: &Options) -> Result<(), String> {
     let settings = Settings {
         seed: options.seed,
         epoch: options.seed.map(|_| source_date_epoch()),
-        planes: options.planes,
         clean: options.clean,
     };
 
@@ -418,29 +401,14 @@ mod tests {
         assert_eq!(options.input, Path::new("board.zip"));
         assert_eq!(options.out.as_deref(), Some(Path::new("out.zip")));
         assert!(!options.quiet);
-        assert_eq!(options.planes, PlaneMode::Warn);
     }
 
     #[test]
     fn parses_processing_flags() {
-        let options = parse(&[
-            "--clean",
-            "--force",
-            "--planes",
-            "positive",
-            "--seed",
-            "7",
-            "board.zip",
-        ]);
+        let options = parse(&["--clean", "--force", "--seed", "7", "board.zip"]);
         assert!(options.clean);
         assert!(options.force);
-        assert_eq!(options.planes, PlaneMode::Positive);
         assert_eq!(options.seed, Some(7));
-    }
-
-    #[test]
-    fn rejects_bad_plane_mode() {
-        assert!(parse_args(args(&["--planes", "maybe", "board.zip"]).into_iter()).is_err());
     }
 
     #[test]

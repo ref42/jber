@@ -11,30 +11,11 @@ use crate::{banner, excellon, gerber, naming, stack, watermark};
 
 pub const GUIDE_NAME: &str = "PCB下单必读.txt";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlaneMode {
-    /// Keep the vendor's negative image and warn about it.
-    Warn,
-    /// Re-emit negative planes as positive images.
-    Positive,
-}
-
+#[derive(Default)]
 pub struct Settings {
     pub seed: Option<u64>,
     pub epoch: Option<i64>,
-    pub planes: PlaneMode,
     pub clean: bool,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            seed: None,
-            epoch: None,
-            planes: PlaneMode::Warn,
-            clean: false,
-        }
-    }
 }
 
 pub struct Output {
@@ -81,12 +62,12 @@ pub fn convert(
     })?;
 
     let mapping = naming::plan(&names, primary_eda);
-    let outline_frame = outline_frame(&mapping, &files);
 
     let mut stamp = Stamp::new(settings.seed, settings.epoch);
     let mut outputs: Vec<Output> = Vec::new();
     let mut drill_sources: Vec<(String, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    let mut negative_planes: Vec<String> = Vec::new();
 
     for name in &names {
         let renamed = mapping.get(name).cloned().unwrap_or_else(|| name.clone());
@@ -112,21 +93,9 @@ pub fn convert(
 
         // Altium marks solder-mask layers as negative too, but that is the
         // normal way to plot mask openings; only inner planes are genuinely
-        // inverted images that a fab may misinterpret.
+        // inverted images, so just note them and leave the artwork untouched.
         if renamed.starts_with("Gerber_InnerLayer") && gerber::is_negative(&content) {
-            if settings.planes == PlaneMode::Positive {
-                if let Some(frame) = outline_frame {
-                    content = gerber::to_positive(&content, &frame);
-                } else {
-                    warnings.push(format!(
-                        "{name} is a negative plane layer, but no outline was available to convert it; leaving it as is"
-                    ));
-                }
-            } else {
-                warnings.push(format!(
-                    "{name} is a negative plane layer ({renamed}); many fabs ignore TF.FilePolarity — re-export it as positive or rerun with --planes=positive"
-                ));
-            }
+            negative_planes.push(renamed.clone());
         }
 
         content = format!("{}{content}", stamp.gerber_header());
@@ -138,6 +107,14 @@ pub fn convert(
             data: content.into_bytes(),
             plot: is_plot(&renamed),
         });
+    }
+
+    if !negative_planes.is_empty() {
+        warnings.push(format!(
+            "negative plane layer{} kept as-is: {} (TF.FilePolarity,Negative; check that your fab renders it correctly)",
+            if negative_planes.len() == 1 { "" } else { "s" },
+            negative_planes.join(", ")
+        ));
     }
 
     let merged = excellon::merge(&drill_sources, &mut stamp);
@@ -195,20 +172,6 @@ pub fn convert(
         kept,
         drill_sources: drill_sources.len(),
     })
-}
-
-/// Artwork extent of the outline layer, used to paint planes when converting
-/// them from negative to positive.
-fn outline_frame(
-    mapping: &BTreeMap<String, String>,
-    files: &BTreeMap<String, Vec<u8>>,
-) -> Option<gerber::Frame> {
-    let (source, _) = mapping
-        .iter()
-        .find(|(_, renamed)| renamed.as_str() == "Gerber_BoardOutlineLayer.GKO")?;
-
-    let content = files.get(source)?;
-    gerber::frame(&decode(content))
 }
 
 fn decode(bytes: &[u8]) -> String {
@@ -348,24 +311,6 @@ mod tests {
         let binary = find(&conversion, "binary.dat");
         assert_eq!(binary.data, vec![0x00, 0x9f, 0x92, 0x96]);
         assert!(!binary.plot);
-    }
-
-    #[test]
-    fn converts_planes_to_positive_on_request() {
-        let settings = Settings {
-            seed: Some(1),
-            epoch: Some(0),
-            planes: PlaneMode::Positive,
-            clean: false,
-        };
-        let conversion = convert(altium_files(), &settings).expect("convert");
-        let plane = String::from_utf8(find(&conversion, "Gerber_InnerLayer1.G1").data.clone())
-            .expect("utf8");
-
-        assert!(plane.contains("%LPC*%"));
-        assert!(plane.contains("%LPD*%"));
-        assert!(!plane.contains("Negative"));
-        assert!(plane.ends_with("%LPD*%\nM02*\n"));
     }
 
     #[test]
