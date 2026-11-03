@@ -1,0 +1,16 @@
+[package]
+name = "jerber"
+version = "0.1.0"
+edition = "2024"
+description = "Turn Altium, KiCad and EasyEDA Gerber archives into JLCPCB-ready sets"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+chrono = "0.4.45"
+md-5 = "0.11.0"
+zip = "9.2.2"
+
+[profile.release]
+lto = true
+strip = true
