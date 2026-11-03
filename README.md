@@ -24,10 +24,6 @@ jerber ./gerbers -o ./new_gerbers.zip
 # Keep only manufacturing layers, merged drills and the order guide:
 jerber GERBER.zip --clean
 
-# Reproducible output (headers + watermark); timestamp comes from
-# SOURCE_DATE_EPOCH when set:
-jerber GERBER.zip --seed 7 -o repeatable.zip
-
 # Overwrite an existing output:
 jerber GERBER.zip -o NEW_GERBER.zip --force
 

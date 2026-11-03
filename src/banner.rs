@@ -20,12 +20,6 @@ impl Noise {
         Self(seed)
     }
 
-    fn from_seed(seed: u64) -> Self {
-        // Mix before forcing oddness so neighbouring seeds do not collapse
-        // onto the same state.
-        Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-    }
-
     fn next(&mut self) -> u64 {
         let mut state = self.0;
         state ^= state >> 12;
@@ -50,28 +44,18 @@ struct Identity {
     timestamp: String,
 }
 
-/// Produces the randomized parts of the headers. With a fixed seed and epoch
-/// the whole conversion becomes reproducible, which the regression tests use.
+/// Produces the randomized parts of the headers.
 pub struct Stamp {
     noise: Noise,
     timestamp: String,
 }
 
 impl Stamp {
-    pub fn new(seed: Option<u64>, epoch: Option<i64>) -> Self {
-        let noise = match seed {
-            Some(seed) => Noise::from_seed(seed),
-            None => Noise::seeded(),
-        };
-
-        let timestamp = match epoch {
-            Some(seconds) => chrono::DateTime::from_timestamp(seconds, 0)
-                .map(|moment| moment.format("%Y-%m-%d %H:%M:%S").to_string())
-                .unwrap_or_else(|| "1970-01-01 00:00:00".to_string()),
-            None => Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        };
-
-        Self { noise, timestamp }
+    pub fn new() -> Self {
+        Self {
+            noise: Noise::seeded(),
+            timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        }
     }
 
     fn identity(&mut self) -> Identity {

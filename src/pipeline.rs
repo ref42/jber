@@ -13,8 +13,6 @@ pub const GUIDE_NAME: &str = "PCB下单必读.txt";
 
 #[derive(Default)]
 pub struct Settings {
-    pub seed: Option<u64>,
-    pub epoch: Option<i64>,
     pub clean: bool,
 }
 
@@ -63,7 +61,7 @@ pub fn convert(
 
     let mapping = naming::plan(&names, primary_eda);
 
-    let mut stamp = Stamp::new(settings.seed, settings.epoch);
+    let mut stamp = Stamp::new();
     let mut outputs: Vec<Output> = Vec::new();
     let mut drill_sources: Vec<(String, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -261,12 +259,7 @@ mod tests {
 
     #[test]
     fn converts_an_altium_board_with_planes() {
-        let settings = Settings {
-            seed: Some(1),
-            epoch: Some(0),
-            ..Default::default()
-        };
-        let conversion = convert(altium_files(), &settings).expect("convert");
+        let conversion = convert(altium_files(), &Settings::default()).expect("convert");
 
         assert_eq!(conversion.layers, 4);
         assert_eq!(conversion.mapping["main.GP1"], "Gerber_InnerLayer1.G1");
@@ -302,12 +295,7 @@ mod tests {
 
     #[test]
     fn keeps_attachment_bytes_untouched() {
-        let settings = Settings {
-            seed: Some(1),
-            epoch: Some(0),
-            ..Default::default()
-        };
-        let conversion = convert(altium_files(), &settings).expect("convert");
+        let conversion = convert(altium_files(), &Settings::default()).expect("convert");
         let binary = find(&conversion, "binary.dat");
         assert_eq!(binary.data, vec![0x00, 0x9f, 0x92, 0x96]);
         assert!(!binary.plot);
@@ -338,35 +326,6 @@ mod tests {
                 .outputs
                 .iter()
                 .any(|output| output.name == "PCB下单必读.txt")
-        );
-    }
-
-    #[test]
-    fn the_same_seed_reproduces_the_archive() {
-        let settings = Settings {
-            seed: Some(42),
-            epoch: Some(1_600_000_000),
-            ..Default::default()
-        };
-
-        let first = convert(altium_files(), &settings).expect("convert");
-        let second = convert(altium_files(), &settings).expect("convert");
-
-        assert_eq!(first.outputs.len(), second.outputs.len());
-        for (left, right) in first.outputs.iter().zip(second.outputs.iter()) {
-            assert_eq!(left.name, right.name);
-            assert_eq!(left.data, right.data);
-        }
-
-        let other = Settings {
-            seed: Some(43),
-            epoch: Some(1_600_000_000),
-            ..Default::default()
-        };
-        let third = convert(altium_files(), &other).expect("convert");
-        assert_ne!(
-            find(&first, "Gerber_TopLayer.GTL").data,
-            find(&third, "Gerber_TopLayer.GTL").data
         );
     }
 

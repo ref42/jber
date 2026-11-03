@@ -35,7 +35,6 @@ OPTIONS:
     -q, --quiet         Print the summary only
         --clean         Keep only manufacturing layers, drills and the guide
         --force         Overwrite an existing output file
-        --seed <N>      Deterministic headers/watermark (also honours SOURCE_DATE_EPOCH)
     -h, --help          Show this help
     -V, --version       Show the version
 ";
@@ -67,7 +66,6 @@ struct Options {
     quiet: bool,
     clean: bool,
     force: bool,
-    seed: Option<u64>,
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, String> {
@@ -76,7 +74,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
     let mut quiet = false;
     let mut clean = false;
     let mut force = false;
-    let mut seed: Option<u64> = None;
     let mut args = args.peekable();
 
     while let Some(arg) = args.next() {
@@ -105,14 +102,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
             "-o" | "--out" => {
                 out = Some(PathBuf::from(take_value(&flag, inline, &mut args)?));
             }
-            "--seed" => {
-                let value = take_value(&flag, inline, &mut args)?;
-                seed = Some(
-                    value
-                        .parse()
-                        .map_err(|_| format!("invalid seed: {value}"))?,
-                );
-            }
             other if other.starts_with('-') && other.len() > 1 => {
                 return Err(format!("unknown option: {other}"));
             }
@@ -132,7 +121,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
         quiet,
         clean,
         force,
-        seed,
     }))
 }
 
@@ -160,8 +148,6 @@ fn run(options: &Options) -> Result<(), String> {
     }
 
     let settings = Settings {
-        seed: options.seed,
-        epoch: options.seed.map(|_| source_date_epoch()),
         clean: options.clean,
     };
 
@@ -183,14 +169,6 @@ fn run(options: &Options) -> Result<(), String> {
 
     report(options, &conversion, &out_path);
     Ok(())
-}
-
-/// Reproducible-builds convention: lets callers pin the header timestamp.
-fn source_date_epoch() -> i64 {
-    std::env::var("SOURCE_DATE_EPOCH")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0)
 }
 
 fn default_output(input: &Path, eda: Eda, layers: u32) -> PathBuf {
@@ -405,10 +383,9 @@ mod tests {
 
     #[test]
     fn parses_processing_flags() {
-        let options = parse(&["--clean", "--force", "--seed", "7", "board.zip"]);
+        let options = parse(&["--clean", "--force", "board.zip"]);
         assert!(options.clean);
         assert!(options.force);
-        assert_eq!(options.seed, Some(7));
     }
 
     #[test]
