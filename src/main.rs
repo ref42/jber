@@ -25,10 +25,12 @@ USAGE:
 
 OPTIONS:
     -o, --out <PATH>    Output path. A *.zip path is written as an archive, any
-                        other path as a folder. Default: <input>-<AD|Ki|ED>-L<layers>.zip
-                        next to the input.
+                        other path as a folder. Default:
+                        <input>-<Altium|KiCad|Easy>-L<layers>.zip next to the input.
     -q, --quiet         Print the summary only
         --clean         Keep only manufacturing layers, drills and the guide
+                        (this is the default)
+        --keep-extra    Also keep drawings, reports and job files
         --force         Overwrite an existing output file
     -h, --help          Show this help
     -V, --version       Show the version
@@ -59,7 +61,7 @@ struct Options {
     input: PathBuf,
     out: Option<PathBuf>,
     quiet: bool,
-    clean: bool,
+    keep_extra: bool,
     force: bool,
 }
 
@@ -67,7 +69,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
     let mut input: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut quiet = false;
-    let mut clean = false;
+    let mut keep_extra = false;
     let mut force = false;
     let mut args = args.peekable();
 
@@ -92,7 +94,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
                 return Ok(None);
             }
             "-q" | "--quiet" => quiet = true,
-            "--clean" => clean = true,
+            "--clean" => keep_extra = false,
+            "--keep-extra" | "--all" => keep_extra = true,
             "--force" => force = true,
             "-o" | "--out" => {
                 out = Some(PathBuf::from(take_value(&flag, inline, &mut args)?));
@@ -114,7 +117,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
         input,
         out,
         quiet,
-        clean,
+        keep_extra,
         force,
     }))
 }
@@ -143,7 +146,7 @@ fn run(options: &Options) -> Result<(), String> {
     }
 
     let settings = Settings {
-        clean: options.clean,
+        keep_extra: options.keep_extra,
     };
 
     let conversion = pipeline::convert(files, &settings)?;
@@ -334,8 +337,10 @@ fn report(options: &Options, conversion: &Conversion, out_path: &Path) {
         conversion.drill_sources
     );
     println!("Added     order guide");
-    if options.clean {
-        println!("Cleaned   reports and drawings removed");
+    if options.keep_extra {
+        println!("Kept      drawings and reports as well");
+    } else {
+        println!("Kept      manufacturing layers only");
     }
     println!();
 
@@ -378,9 +383,19 @@ mod tests {
 
     #[test]
     fn parses_processing_flags() {
-        let options = parse(&["--clean", "--force", "board.zip"]);
-        assert!(options.clean);
+        let options = parse(&["--force", "board.zip"]);
+        assert!(!options.keep_extra);
         assert!(options.force);
+    }
+
+    #[test]
+    fn manufacturing_only_is_the_default_and_opt_out_is_possible() {
+        assert!(!parse(&["board.zip"]).keep_extra);
+        assert!(!parse(&["--clean", "board.zip"]).keep_extra);
+        assert!(parse(&["--keep-extra", "board.zip"]).keep_extra);
+        assert!(parse(&["--all", "board.zip"]).keep_extra);
+        // The last flag wins, so a script can override an earlier one.
+        assert!(!parse(&["--keep-extra", "--clean", "board.zip"]).keep_extra);
     }
 
     #[test]
@@ -397,10 +412,10 @@ mod tests {
     #[test]
     fn default_output_matches_the_web_naming() {
         let path = default_output(Path::new("gerbers/board.zip"), Eda::Altium, 4);
-        assert_eq!(path, Path::new("gerbers/board-AD-L4.zip"));
+        assert_eq!(path, Path::new("gerbers/board-Altium-L4.zip"));
 
         let path = default_output(Path::new("gerbers/board.zip"), Eda::KiCad, 2);
-        assert_eq!(path, Path::new("gerbers/board-Ki-L2.zip"));
+        assert_eq!(path, Path::new("gerbers/board-KiCad-L2.zip"));
     }
 
     #[test]

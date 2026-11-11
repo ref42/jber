@@ -62,9 +62,9 @@ mod tests {
         assert_eq!(Eda::Altium.label(), "Altium");
         assert_eq!(Eda::KiCad.label(), "KiCad");
         assert_eq!(Eda::EasyEDA.label(), "EasyEDA");
-        assert_eq!(Eda::Altium.tag(), "AD");
-        assert_eq!(Eda::KiCad.tag(), "Ki");
-        assert_eq!(Eda::EasyEDA.tag(), "ED");
+        assert_eq!(Eda::Altium.tag(), "Altium");
+        assert_eq!(Eda::KiCad.tag(), "KiCad");
+        assert_eq!(Eda::EasyEDA.tag(), "Easy");
     }
 
     #[test]

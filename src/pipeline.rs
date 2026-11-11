@@ -19,7 +19,11 @@ const DRILL_NPTH: &str = "Drill_NPTH_Through.DRL";
 /// Conversion options supplied by the CLI.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Settings {
-    pub clean: bool,
+    /// Keep drawings, reports and job files next to the manufacturing layers.
+    ///
+    /// Off by default: those files are what makes a fab report "no usable
+    /// graphics" instead of the board size.
+    pub keep_extra: bool,
 }
 
 /// One file in the produced set.
@@ -58,7 +62,7 @@ pub fn convert(
 
     let namer = Namer::new(eda, names.iter().map(String::as_str));
 
-    let mut outputs: Vec<Output> = Vec::new();
+    let mut entries: Vec<(String, Output)> = Vec::new();
     let mut mapping: BTreeMap<String, String> = BTreeMap::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut negative_planes: Vec<String> = Vec::new();
@@ -110,12 +114,17 @@ pub fn convert(
             None => data.clone(),
         };
 
-        outputs.push(Output {
-            name: mapped.clone(),
-            data: converted,
-            plot: is_plot(&mapped),
-        });
+        entries.push((
+            name.clone(),
+            Output {
+                name: mapped.clone(),
+                data: converted,
+                plot: is_plot(&mapped),
+            },
+        ));
     }
+
+    let mut outputs = merge_sources(entries, &mut warnings);
 
     if !negative_planes.is_empty() {
         warnings.push(format!(
@@ -124,11 +133,31 @@ pub fn convert(
         ));
     }
 
+    if let Some(outline) = outputs
+        .iter()
+        .find(|output| output.name.starts_with("Gerber_BoardOutlineLayer"))
+        && !has_artwork(&outline.data)
+    {
+        warnings.push(format!(
+            "{} contains no artwork: the fab cannot detect the board size from it",
+            outline.name
+        ));
+    }
+
     let (layers, layer_warnings) = validate(&outputs)?;
     warnings.extend(layer_warnings);
 
-    if settings.clean {
+    outputs = drop_empty_layers(outputs, &mut warnings);
+
+    if !settings.keep_extra {
+        let before = outputs.len();
         outputs.retain(|output| output.plot || output.name == GUIDE_NAME);
+        let dropped = before - outputs.len();
+        if dropped > 0 {
+            warnings.push(format!(
+                "kept manufacturing layers only: left out {dropped} drawing/report file(s)"
+            ));
+        }
     }
 
     let (pth, npth) = excellon::merge(drill_tools);
@@ -171,6 +200,107 @@ pub fn convert(
         kept,
         drill_sources,
     })
+}
+
+// --- One source per layer --------------------------------------------------
+
+/// Altium happily exports several files that mean the same layer: a board
+/// shape on Mechanical 1 *and* an empty Keep-Out layer both claim to be the
+/// outline, and a Mid-Layer and an internal plane can both claim
+/// `Gerber_InnerLayer1`. A zip cannot carry two entries with one name, and a
+/// fab that is handed two outlines picks the wrong one, so keep the best
+/// source per canonical name and drop the rest with a warning.
+fn merge_sources(entries: Vec<(String, Output)>, warnings: &mut Vec<String>) -> Vec<Output> {
+    let mut order: Vec<String> = Vec::new();
+    let mut chosen: BTreeMap<String, (String, Output)> = BTreeMap::new();
+
+    for (source, output) in entries {
+        let name = output.name.clone();
+        match chosen.remove(&name) {
+            None => {
+                order.push(name.clone());
+                chosen.insert(name, (source, output));
+            }
+            Some((kept_source, kept)) => {
+                let (winner, loser) = if preferred(&source, &output, &kept_source, &kept) {
+                    ((source, output), kept_source)
+                } else {
+                    ((kept_source, kept), source)
+                };
+                warnings.push(format!(
+                    "dropped {loser}: {name} is already produced by {}",
+                    winner.0
+                ));
+                chosen.insert(name, winner);
+            }
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|name| chosen.remove(&name).map(|(_, output)| output))
+        .collect()
+}
+
+/// `a` wins when it has artwork and `b` does not. When both or neither have
+/// artwork, the source that behaves most like an Altium board outline wins, and
+/// equal ranks fall back to the smaller name so the choice is stable.
+fn preferred(a_source: &str, a: &Output, b_source: &str, b: &Output) -> bool {
+    let artwork = has_artwork(&a.data);
+    if artwork != has_artwork(&b.data) {
+        return artwork;
+    }
+    (outline_rank(a_source), a_source) < (outline_rank(b_source), b_source)
+}
+
+/// Lower is closer to a conventional Altium board outline.
+fn outline_rank(source: &str) -> u8 {
+    let lower = source.to_lowercase();
+    if lower.contains("edge_cuts") {
+        0
+    } else if lower.ends_with(".gm1") {
+        1
+    } else if lower.ends_with(".gm13") {
+        2
+    } else if lower.ends_with(".gko") {
+        3
+    } else if lower.ends_with(".gm") {
+        4
+    } else {
+        5
+    }
+}
+
+/// A Gerber layer with nothing on it is noise: Altium still exports the header
+/// of an unused layer (an empty bottom silkscreen, for example), and a fab that
+/// reads it reports "no usable graphics" for that layer. Drop the empty plots,
+/// but never the layers the fab requires to understand the board.
+fn drop_empty_layers(outputs: Vec<Output>, warnings: &mut Vec<String>) -> Vec<Output> {
+    let required = [
+        "Gerber_BoardOutlineLayer",
+        "Gerber_TopLayer",
+        "Gerber_TopSolderMaskLayer",
+    ];
+    let mut kept = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let needed = required
+            .iter()
+            .any(|prefix| output.name.starts_with(prefix));
+        if output.plot && !needed && !has_artwork(&output.data) {
+            warnings.push(format!("dropped empty layer: {}", output.name));
+        } else {
+            kept.push(output);
+        }
+    }
+    kept
+}
+
+/// A Gerber layer has artwork when it draws, flashes or fills something.
+/// Altium still writes the header and `M02*` for a layer with nothing on it,
+/// which a fab reads as "this layer is empty".
+fn has_artwork(data: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(data);
+    text.contains("D01*") || text.contains("D03*") || text.contains("G36*")
 }
 
 /// Parse one drill source. Altium and EasyEDA use the Altium dialect; KiCad
@@ -261,6 +391,9 @@ fn altium_name(name: &str, has_gm_extension: bool) -> Option<String> {
     let lower = name.to_lowercase();
 
     if lower.ends_with(".gm1") || lower.ends_with(".gm13") {
+        return Some("Gerber_BoardOutlineLayer.GKO".to_string());
+    }
+    if lower.ends_with(".gko") {
         return Some("Gerber_BoardOutlineLayer.GKO".to_string());
     }
     if lower.ends_with(".gm") {
@@ -586,7 +719,15 @@ fn starts_with_dcode(line: &str) -> bool {
     if !(2..=4).contains(&digits) {
         return false;
     }
-    rest.as_bytes().get(digits) == Some(&b'*')
+    if rest.as_bytes().get(digits) != Some(&b'*') {
+        return false;
+    }
+    // `D01`, `D02` and `D03` are operation codes (interpolate, move, flash), not
+    // aperture selections, and Altium writes them on their own line around
+    // regions. Prefixing them with `G54` would ask the fab's parser to select
+    // an aperture numbered 1-3, which does not exist, and the whole layer gets
+    // rejected. Only real apertures (D10 and up) get the prefix.
+    rest[..digits].parse::<u32>().is_ok_and(|code| code > 3)
 }
 
 fn inject_tracking(text: &str) -> String {
@@ -752,6 +893,10 @@ mod tests {
         );
         assert_eq!(
             altium_name("main.GM13", false).as_deref(),
+            Some("Gerber_BoardOutlineLayer.GKO")
+        );
+        assert_eq!(
+            altium_name("main.GKO", false).as_deref(),
             Some("Gerber_BoardOutlineLayer.GKO")
         );
         assert_eq!(
@@ -950,6 +1095,128 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert!((tools[0].hits[0].to.0 - 1.0).abs() < 1e-9);
         assert!((tools[0].hits[0].to.1 - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dcode_normalization_leaves_operation_codes_alone() {
+        let input = "G36*\nX1Y2D02*\nD01*\nD02*\nD03*\nG54D02*\nD10*\nG37*\n";
+        let expected = "G36*\nX1Y2D02*\nD01*\nD02*\nD03*\nG54D02*\nG54D10*\nG37*\n";
+        assert_eq!(normalize_dcodes(input, Eda::Altium), expected);
+        assert_eq!(normalize_dcodes(input, Eda::KiCad), expected);
+    }
+
+    #[test]
+    fn dcode_normalization_never_creates_an_aperture_below_four() {
+        let input = "D02*\nD03*\nD04*\n";
+        let output = normalize_dcodes(input, Eda::Altium);
+        assert!(!output.contains("G54D02"));
+        assert!(!output.contains("G54D03"));
+        assert!(output.contains("G54D04"));
+    }
+
+    fn layer(source: &str, name: &str, body: &str) -> (String, Output) {
+        (
+            source.to_string(),
+            Output {
+                name: name.to_string(),
+                data: body.as_bytes().to_vec(),
+                plot: true,
+            },
+        )
+    }
+
+    const OUTLINE: &str = "Gerber_BoardOutlineLayer.GKO";
+
+    #[test]
+    fn empty_outline_source_loses_against_a_drawn_one() {
+        let entered = vec![
+            layer("main.GKO", OUTLINE, "%MOMM*%\nM02*\n"),
+            layer("main.GM1", OUTLINE, "%MOMM*%\nX0Y0D02*\nX1Y1D01*\nM02*\n"),
+        ];
+        let mut warnings = Vec::new();
+        let outputs = merge_sources(entered, &mut warnings);
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].data.starts_with(b"%MOMM*%\nX0Y0D02*"));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("dropped main.GKO"));
+    }
+
+    #[test]
+    fn mechanical_one_outranks_a_drawn_keep_out_layer() {
+        let entered = vec![
+            layer("main.GKO", OUTLINE, "%MOMM*%\nX9Y9D01*\n"),
+            layer("main.GM1", OUTLINE, "%MOMM*%\nX0Y0D01*\n"),
+        ];
+        let mut warnings = Vec::new();
+        let outputs = merge_sources(entered, &mut warnings);
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].data.starts_with(b"%MOMM*%\nX0Y0D01*"));
+        assert!(warnings[0].contains("dropped main.GKO"));
+    }
+
+    #[test]
+    fn duplicate_inner_layers_collapse_to_one_entry() {
+        let entered = vec![
+            layer("main.G1", "Gerber_InnerLayer1.G1", "%MOMM*%\nX0Y0D01*\n"),
+            layer("main.GP1", "Gerber_InnerLayer1.G1", "%MOMM*%\nX5Y5D01*\n"),
+        ];
+        let mut warnings = Vec::new();
+        let outputs = merge_sources(entered, &mut warnings);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn distinct_layers_keep_their_order() {
+        let entered = vec![
+            layer("a.GTL", "Gerber_TopLayer.GTL", "%MOMM*%\nX0Y0D01*\n"),
+            layer("b.GKO", OUTLINE, "%MOMM*%\nX0Y0D01*\n"),
+            layer("c.GBL", "Gerber_BottomLayer.GBL", "%MOMM*%\nX0Y0D01*\n"),
+        ];
+        let mut warnings = Vec::new();
+        let outputs = merge_sources(entered, &mut warnings);
+        assert_eq!(
+            outputs.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(),
+            ["Gerber_TopLayer.GTL", OUTLINE, "Gerber_BottomLayer.GBL"]
+        );
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn artwork_detection_ignores_an_empty_layer() {
+        assert!(!has_artwork(b"%MOMM*%\nM02*\n"));
+        assert!(has_artwork(b"%MOMM*%\nX1Y2D01*\n"));
+        assert!(has_artwork(b"%MOMM*%\nX1Y2D03*\n"));
+        assert!(has_artwork(b"%MOMM*%\nG36*\nX1Y2D02*\nG37*\n"));
+    }
+
+    #[test]
+    fn empty_layers_are_dropped_but_required_ones_stay() {
+        let outputs = vec![
+            Output {
+                name: "Gerber_BottomSilkscreenLayer.GBO".to_string(),
+                data: b"%MOMM*%\nM02*\n".to_vec(),
+                plot: true,
+            },
+            Output {
+                name: "Gerber_TopSolderMaskLayer.GTS".to_string(),
+                data: b"%MOMM*%\nM02*\n".to_vec(),
+                plot: true,
+            },
+            Output {
+                name: GUIDE_NAME.to_string(),
+                data: Vec::new(),
+                plot: false,
+            },
+        ];
+        let mut warnings = Vec::new();
+        let kept = drop_empty_layers(outputs, &mut warnings);
+        assert_eq!(
+            kept.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(),
+            ["Gerber_TopSolderMaskLayer.GTS", GUIDE_NAME]
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("Gerber_BottomSilkscreenLayer.GBO"));
     }
 
     #[test]
