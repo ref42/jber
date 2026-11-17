@@ -1,6 +1,6 @@
 /* src/main.rs */
 
-//! `jber` — convert a Gerber archive into a JLCPCB-ready set.
+//! `jber` — turn an Altium, KiCad or EasyEDA Gerber archive into a fab-ready set.
 
 mod eda;
 mod excellon;
@@ -18,7 +18,7 @@ use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
 const USAGE: &str = "\
-jber — convert a Gerber archive into a JLCPCB-ready set
+jber — turn an Altium, KiCad or EasyEDA Gerber archive into a fab-ready set
 
 USAGE:
     jber <INPUT.zip|DIR> [-o OUTPUT] [-q|--quiet] [OPTIONS]

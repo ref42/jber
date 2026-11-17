@@ -59,7 +59,7 @@ pub fn is_drill_file(name: &str) -> bool {
     (1..=6).any(|index| lower.ends_with(&format!(".tx{index}")))
 }
 
-/// `.tx1`–`.tx6` plots are blind/buried via layers, which JLCPCB cannot use.
+/// `.tx1`–`.tx6` plots are blind/buried via layers, which fabs do not accept.
 pub(crate) fn is_blind_buried(name: &str) -> bool {
     let lower = name.to_lowercase();
     (1..=6).any(|index| lower.ends_with(&format!(".tx{index}")))

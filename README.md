@@ -3,19 +3,35 @@
 [![CI](https://github.com/ref42/jber/actions/workflows/ci.yml/badge.svg)](https://github.com/ref42/jber/actions/workflows/ci.yml)
 [![Release](https://github.com/ref42/jber/actions/workflows/release.yml/badge.svg)](https://github.com/ref42/jber/releases/latest)
 
-jber meas Just Gerber or JLC Gerber.
+jber means Just Gerber: it turns an Altium, KiCad or EasyEDA Gerber archive into
+a clean manufacturing set that a fab can read.
 
 ## EDA SUPPORTED
 - Altium Designer
 - KiCAD
 - EasyEDA
 
-## Install
+## Platforms
 
-Prebuilt binaries for Linux (x86_64, aarch64), macOS (x86_64, Apple silicon) and
-Windows (x86_64) are attached to every
-[release](https://github.com/ref42/jber/releases/latest), together with a
-`SHA256SUMS.txt`.
+Every [release](https://github.com/ref42/jber/releases/latest) ships one
+self-contained file per platform — no installer, no archive:
+
+| file | platform |
+| --- | --- |
+| `jber-<version>-windows-x64.exe` | Windows 10/11, x64 |
+| `jber-<version>-windows-arm64.exe` | Windows 11 on ARM |
+| `jber-<version>-macos-arm64` | macOS, Apple silicon |
+| `jber-<version>-macos-x64` | macOS, Intel |
+| `jber-<version>-linux-x64` | Linux, x86_64 (statically linked) |
+| `jber-<version>-linux-arm64` | Linux, arm64 (statically linked) |
+
+The Linux builds are static, so they run on any distribution regardless of the
+glibc version. On macOS and Linux, mark the download executable first:
+
+```sh
+chmod +x jber-1.0.0-linux-x64
+./jber-1.0.0-linux-x64 --version
+```
 
 From source:
 
@@ -67,7 +83,7 @@ cargo test
 ```
 
 CI runs those on Linux, macOS and Windows for every push to `master` and every
-pull request. Pushing a `v*` tag builds the binaries for all targets above and
+pull request. Pushing a `v*` tag builds the binaries for all platforms above and
 publishes them as a GitHub release:
 
 ```sh
@@ -78,7 +94,3 @@ git push origin v1.0.0
 ## License
 
 MIT — see `LICENSE`.
-
-## Special Thanks
-
-- [fuckjlc](https://github.com/acha666/FuckJLC)

@@ -2,11 +2,11 @@
 name = "jber"
 version = "1.0.0"
 edition = "2024"
-description = "Turn Altium, KiCad and EasyEDA Gerber archives into JLCPCB-ready sets"
+description = "Turn Altium, KiCad and EasyEDA Gerber archives into fab-ready manufacturing sets"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/ref42/jber"
-keywords = ["gerber", "jlcpcb", "kicad", "altium", "eda"]
+keywords = ["gerber", "pcb", "kicad", "altium", "eda"]
 categories = ["command-line-utilities"]
 
 [dependencies]

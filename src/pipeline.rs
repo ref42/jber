@@ -11,7 +11,8 @@ use crate::eda::{self, Eda};
 use crate::excellon::{self, Plating, Tool};
 
 const GUIDE_NAME: &str = "PCB下单必读.txt";
-const GUIDE: &str = "PCB 下单说明\n\n上传本压缩包即可下单。\n参考：\nhttps://prodocs.lceda.cn/cn/pcb/order-order-pcb/index.html";
+const GUIDE: &str =
+    "PCB 下单说明\n\n把本压缩包上传到板厂的下单页面即可，板厂会从中读取板尺寸、层数与钻孔信息。";
 
 const DRILL_PTH: &str = "Drill_PTH_Through.DRL";
 const DRILL_NPTH: &str = "Drill_NPTH_Through.DRL";
