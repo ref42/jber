@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "jber"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "md-5",

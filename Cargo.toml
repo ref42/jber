@@ -1,6 +1,6 @@
 [package]
 name = "jber"
-version = "1.0.1"
+version = "1.0.0"
 edition = "2024"
 description = "Turn Altium, KiCad and EasyEDA Gerber archives into fab-ready manufacturing sets"
 license = "MIT"
