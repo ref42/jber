@@ -1041,9 +1041,9 @@ mod tests {
         let output = inject_tracking(&input);
         let lines: Vec<&str> = output.lines().collect();
 
-        assert!(lines.iter().any(|line| *line == "%ADD16C,0.15000*%"));
-        assert!(!lines.iter().any(|line| *line == "%ADD15C,0.15000*%"));
-        assert!(!lines.iter().any(|line| *line == "%ADD15C,0.42000*%"));
+        assert!(lines.contains(&"%ADD16C,0.15000*%"));
+        assert!(!lines.contains(&"%ADD15C,0.15000*%"));
+        assert!(!lines.contains(&"%ADD15C,0.42000*%"));
 
         let stamped = lines
             .iter()
